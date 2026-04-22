@@ -273,6 +273,91 @@ Visualization and storytelling layer.
 
 ---
 
+
+# 🛠️ Tech Stack (MANDATORY REFERENCE)
+
+## 🎯 Guiding Principles
+
+* Keep it **simple, fast, demoable**
+* Use **Google stack where it adds value**
+* Avoid over-engineering
+
+---
+
+## Frontend
+
+* **Next.js**
+* **shadcn/ui** (theme MUST NOT be changed)
+* **React Flow** → graph visualization
+* **Recharts** → KPI charts
+
+---
+
+## Backend
+
+* **FastAPI (Python)** → main API layer
+* **Pydantic** → schemas
+* **WebSockets** → real-time simulation updates
+
+---
+
+## Simulation Core
+
+* Python (same FastAPI service or separate module)
+* `networkx` for graph ops
+
+---
+
+## Storage
+
+* **Firestore**
+
+  * runs
+  * replay data
+  * decision logs
+  * markers
+
+---
+
+## Deployment
+
+* **Cloud Run** → backend (FastAPI)
+* **Firebase Hosting** → frontend
+
+---
+
+## Optional (High Value for Judges)
+
+### Vertex AI (Gemini)
+
+Used for:
+
+* explaining decisions
+
+Example:
+
+> “Why was this shipment rerouted?”
+
+Input:
+
+* structured logs
+
+Output:
+
+* human-readable reasoning
+
+---
+
+## ⚠️ Explicitly Avoid
+
+* BigQuery
+* Dataflow
+* Kubernetes
+* Complex distributed infra
+* RL training systems
+
+---
+
 # 🧠 Core System Concepts
 
 ---

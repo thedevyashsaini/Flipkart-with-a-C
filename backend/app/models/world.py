@@ -18,6 +18,7 @@ class Node(BaseModel):
     type: NodeType
     region: str
     capacity: float = Field(gt=0)
+    avg_hold_ticks_per_ton: float = Field(ge=0)
     x: float
     y: float
 

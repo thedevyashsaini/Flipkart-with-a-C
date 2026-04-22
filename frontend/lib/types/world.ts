@@ -6,6 +6,7 @@ export type Node = {
   type: NodeType
   region: string
   capacity: number
+  avg_hold_ticks_per_ton: number
   x: number
   y: number
 }
