@@ -32,6 +32,11 @@ simulator_core: SimulatorCore | None = None
 class SimulationStartRequest(BaseModel):
     seed: int = Field(ge=0)
     tick: int = Field(ge=0, default=0)
+    agent_mode: str = Field(default="without_c")
+
+
+class SimulationAgentModeRequest(BaseModel):
+    agent_mode: str = Field(default="without_c")
 
 
 class SimulationClearResponse(BaseModel):
@@ -51,7 +56,6 @@ def startup() -> None:
     global simulator_core
     world_data = load_world()
     demand_generator = DemandGenerator(world=world_data, seed=42, tick_interval_sec=1.0, window_size=600)
-    demand_generator.start()
     simulator_core = SimulatorCore(world=world_data, demand_generator=demand_generator, tick_interval_sec=1.0)
     simulator_core.start()
 
@@ -102,6 +106,7 @@ async def demand_stream(request: Request) -> StreamingResponse:
 def simulation_state() -> SimulationState:
     if simulator_core is None:
         return SimulationState(
+            agent_mode="without_c",
             tick=0,
             running=False,
             failed=False,
@@ -116,6 +121,8 @@ def simulation_state() -> SimulationState:
             in_transit_shipments=0,
             holding_shipments=0,
             consumed_shipments=0,
+            additional_cost=0,
+            additional_cost_threshold=0,
             node_stats={},
             edge_stats={},
             recent_logs=[],
@@ -132,6 +139,7 @@ async def simulation_stream(request: Request) -> StreamingResponse:
 
             if simulator_core is None:
                 payload = SimulationState(
+                    agent_mode="without_c",
                     tick=0,
                     running=False,
                     failed=False,
@@ -146,6 +154,8 @@ async def simulation_stream(request: Request) -> StreamingResponse:
                     in_transit_shipments=0,
                     holding_shipments=0,
                     consumed_shipments=0,
+                    additional_cost=0,
+                    additional_cost_threshold=0,
                     node_stats={},
                     edge_stats={},
                     recent_logs=[],
@@ -163,7 +173,10 @@ async def simulation_stream(request: Request) -> StreamingResponse:
 def simulation_start(payload: SimulationStartRequest | None = None) -> dict[str, bool]:
     seed = payload.seed if payload is not None else (demand_generator.get_state().seed if demand_generator is not None else 42)
     tick = payload.tick if payload is not None else 0
+    agent_mode = payload.agent_mode if payload is not None else (simulator_core.get_state().agent_mode if simulator_core is not None else "without_c")
 
+    if simulator_core is not None:
+        simulator_core.set_agent_mode(agent_mode)
     if demand_generator is not None:
         demand_generator.configure(seed=seed, start_tick=0)
     if simulator_core is not None:
@@ -182,6 +195,14 @@ def simulation_pause() -> dict[str, bool]:
     if simulator_core is not None:
         simulator_core.set_running(False)
     return {"ok": True}
+
+
+@app.post("/sim/agent")
+def simulation_set_agent_mode(payload: SimulationAgentModeRequest) -> dict[str, str | bool]:
+    mode = "with_c" if payload.agent_mode == "with_c" else "without_c"
+    if simulator_core is not None:
+        simulator_core.set_agent_mode(mode)
+    return {"ok": True, "agent_mode": mode}
 
 
 @app.post("/sim/clear")

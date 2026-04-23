@@ -24,6 +24,7 @@ export type EdgeSimulationStat = {
 }
 
 export type SimulationState = {
+  agent_mode: "without_c" | "with_c"
   tick: number
   running: boolean
   failed: boolean
@@ -38,6 +39,8 @@ export type SimulationState = {
   in_transit_shipments: number
   holding_shipments: number
   consumed_shipments: number
+  additional_cost: number
+  additional_cost_threshold: number
   node_stats: Record<string, NodeSimulationStat>
   edge_stats: Record<string, EdgeSimulationStat>
   recent_logs: SimulationLog[]

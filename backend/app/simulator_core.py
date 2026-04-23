@@ -7,9 +7,10 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from itertools import count
 
+from app.agents.with_c import WithCAgent
 from app.agents.without_c import PlannedHop, WithoutCAgent
 from app.demand_generator import DemandGenerator
-from app.models import EdgeSimulationStat, NodeSimulationStat, ShipmentDemand, SimulationLog, SimulationState, World
+from app.models import EdgeSimulationStat, NodeSimulationStat, ShipmentDemand, ShipmentPriority, SimulationLog, SimulationState, World
 
 
 @dataclass
@@ -21,6 +22,7 @@ class SimShipment:
     created_tick: int
     current_node: str
     deadline_tick: int
+    priority: ShipmentPriority
 
 
 @dataclass
@@ -45,12 +47,25 @@ class HoldingShipment:
 class SimulatorCore:
     FAILURE_FULL_NODE_THRESHOLD = 2
     FULL_NODE_UTILIZATION_THRESHOLD = 0.98
+    FAILURE_SUSTAINED_TICKS = 6
+    WITH_C_ADDITIONAL_COST_THRESHOLD = 220.0
+    WITH_C_MAX_HOLD_SHARE = 0.08
+    WITH_C_FORCE_FORWARD_SOURCE_PRESSURE = 0.72
+    HOLDING_ADMISSION_WEIGHT = 0.22
+    HOLDING_FAILURE_WEIGHT = 0.28
+    PENDING_FAILURE_WEIGHT = 0.15
+    QUEUE_DISPATCH_SOFT_THRESHOLD = 0.45
+    MAX_QUEUE_DISPATCH_BOOST = 3.5
+    SOURCE_THROTTLE_UTILIZATION = 0.9
+    SOURCE_THROTTLE_ADMIT_FRACTION = 0.35
 
     def __init__(self, world: World, demand_generator: DemandGenerator, tick_interval_sec: float = 1.0) -> None:
         self._world = world
         self._demand_generator = demand_generator
         self._tick_interval_sec = tick_interval_sec
-        self._agent = WithoutCAgent(world)
+        self._without_c_agent = WithoutCAgent(world)
+        self._with_c_agent = WithCAgent(world)
+        self._agent_mode = "without_c"
         self._running = False
         self._failed = False
         self._failure_reason = ""
@@ -70,10 +85,17 @@ class SimulatorCore:
         self._pending_admission: dict[str, deque[SimShipment]] = defaultdict(deque)
         self._consumed_shipments = 0
         self._consumed_shipments_tick_by_node: dict[str, int] = {}
+        self._pending_admitted_tick_by_node: dict[str, int] = {}
+        self._pending_admitted_total: int = 0
+        self._ingested_shipments_total: int = 0
+        self._dropped_shipments_total: int = 0
         self._recent_logs: list[SimulationLog] = []
         self._last_edge_move_counts: dict[str, int] = {}
         self._last_edge_move_loads: dict[str, float] = {}
+        self._additional_cost = 0.0
+        self._overload_streak = 0
         self._latest_state = SimulationState(
+            agent_mode=self._agent_mode,
             tick=0,
             running=False,
             failed=False,
@@ -88,6 +110,8 @@ class SimulatorCore:
             in_transit_shipments=0,
             holding_shipments=0,
             consumed_shipments=0,
+            additional_cost=0,
+            additional_cost_threshold=self.WITH_C_ADDITIONAL_COST_THRESHOLD,
             node_stats={},
             edge_stats={},
             recent_logs=[],
@@ -103,6 +127,11 @@ class SimulatorCore:
                 self._failed = False
                 self._failure_reason = ""
             self._running = running
+            self._latest_state = self._build_state(0, 0, 0, 0.0)
+
+    def set_agent_mode(self, mode: str) -> None:
+        with self._state_lock:
+            self._agent_mode = "with_c" if mode == "with_c" else "without_c"
             self._latest_state = self._build_state(0, 0, 0, 0.0)
 
     def clear(self) -> None:
@@ -124,14 +153,19 @@ class SimulatorCore:
             self._pending_admission = defaultdict(deque)
             self._consumed_shipments = 0
             self._consumed_shipments_tick_by_node = {}
+            self._pending_admitted_tick_by_node = {}
+            self._pending_admitted_total = 0
+            self._ingested_shipments_total = 0
+            self._dropped_shipments_total = 0
             self._recent_logs = []
             self._last_edge_move_counts = {}
             self._last_edge_move_loads = {}
+            self._additional_cost = 0.0
+            self._overload_streak = 0
             self._latest_state = self._build_state(0, 0, 0, 0.0)
 
         for _ in range(start_tick):
-            self._demand_generator.advance_one_tick()
-            self._tick_once()
+            self._tick_once(advance_demand=True)
 
     def get_state(self) -> SimulationState:
         with self._state_lock:
@@ -145,8 +179,10 @@ class SimulatorCore:
                 self._tick_once()
             time.sleep(self._tick_interval_sec)
 
-    def _tick_once(self) -> None:
+    def _tick_once(self, advance_demand: bool = True) -> None:
         with self._state_lock:
+            if advance_demand:
+                self._demand_generator.advance_one_tick()
             self._tick += 1
             blocked_admission_tick = self._retry_pending_admission()
             new_demands = self._demand_generator.drain_new_shipments()
@@ -156,12 +192,14 @@ class SimulatorCore:
             moved_shipments_tick, moved_load_tick = self._dispatch_moves()
             self._advance_transit()
             self._advance_holding()
+            self._validate_mass_balance()
             self._evaluate_failure()
 
             self._latest_state = self._build_state(generated_shipments, blocked_admission_tick, moved_shipments_tick, moved_load_tick)
 
     def _build_state(self, generated_shipments: int, blocked_admission_tick: int, moved_shipments_tick: int, moved_load_tick: float) -> SimulationState:
         return SimulationState(
+            agent_mode=self._agent_mode,
             tick=self._tick,
             running=self._running,
             failed=self._failed,
@@ -176,6 +214,8 @@ class SimulatorCore:
             in_transit_shipments=len(self._in_transit),
             holding_shipments=len(self._holding),
             consumed_shipments=self._consumed_shipments,
+            additional_cost=round(self._additional_cost, 3),
+            additional_cost_threshold=self.WITH_C_ADDITIONAL_COST_THRESHOLD,
             node_stats=self._build_node_stats(),
             edge_stats=self._build_edge_stats(),
             recent_logs=list(self._recent_logs[:50]),
@@ -199,8 +239,7 @@ class SimulatorCore:
         stats: dict[str, NodeSimulationStat] = {}
         for node in self._world.nodes:
             node_queue = self._queues.get(node.id, deque())
-            queue_load = sum(shipment.load for shipment in node_queue)
-            active_load = queue_load + holding_load_by_node[node.id]
+            active_load = self._node_operational_load(node.id)
             stats[node.id] = NodeSimulationStat(
                 queued_shipments=queued_by_node.get(node.id, 0),
                 inbound_shipments=inbound_by_node.get(node.id, 0),
@@ -256,6 +295,7 @@ class SimulatorCore:
                 created_tick=self._tick,
                 current_node=demand.source,
                 deadline_tick=demand.deadline_tick,
+                priority=demand.priority,
             )
             if self._node_can_accept(demand.source, shipment.load):
                 self._queues[demand.source].append(shipment)
@@ -263,6 +303,7 @@ class SimulatorCore:
             else:
                 self._pending_admission[demand.source].append(shipment)
                 blocked += 1
+            self._ingested_shipments_total += 1
         if generated > 0:
             self._push_log(f"loaded {generated} shipments into simulation queues")
         if blocked > 0:
@@ -271,16 +312,33 @@ class SimulatorCore:
 
     def _retry_pending_admission(self) -> int:
         admitted = 0
+        admitted_by_node: dict[str, int] = defaultdict(int)
         for node_id, pending in self._pending_admission.items():
+            node = self._node_by_id.get(node_id)
+            cap = node.capacity if node is not None else 0.0
+            overload_ratio = 0.0 if cap <= 0 else self._node_operational_load(node_id) / cap
+            throttle_active = overload_ratio >= self.SOURCE_THROTTLE_UTILIZATION
+            if throttle_active:
+                max_admits = max(1, int(math.ceil(len(pending) * self.SOURCE_THROTTLE_ADMIT_FRACTION)))
+            else:
+                max_admits = len(pending)
+
+            admits_here = 0
             while pending:
+                if admits_here >= max_admits:
+                    break
                 shipment = pending[0]
                 if not self._node_can_accept(node_id, shipment.load):
                     break
                 pending.popleft()
                 self._queues[node_id].append(shipment)
                 admitted += 1
+                admits_here += 1
+                admitted_by_node[node_id] += 1
 
         self._pending_admission = defaultdict(deque, {node_id: queue for node_id, queue in self._pending_admission.items() if queue})
+        self._pending_admitted_tick_by_node = dict(admitted_by_node)
+        self._pending_admitted_total += admitted
         if admitted > 0:
             self._push_log(f"admitted {admitted} pending shipments into nodes with free capacity")
         return 0
@@ -296,30 +354,109 @@ class SimulatorCore:
             if not queue:
                 continue
 
-            dispatch_budget = self._dispatch_limit.get(node_id, 3)
-            moved_from_node = 0
+            if self._agent_mode == "with_c":
+                self._prioritize_queue(node_id)
+                queue = self._queues.get(node_id, queue)
 
-            while moved_from_node < dispatch_budget and queue:
+            dispatch_budget = self._dispatch_limit.get(node_id, 3)
+            dispatch_budget = self._dynamic_dispatch_budget(node_id, dispatch_budget)
+            if self._agent_mode == "with_c":
+                dispatch_budget = max(dispatch_budget + 2, int(math.ceil(dispatch_budget * 1.6)))
+            moved_from_node = 0
+            held_from_node = 0
+            inspected = 0
+            max_inspected = max(len(queue), dispatch_budget * 5)
+            hold_cap = max(1, int(math.ceil(max_inspected * self.WITH_C_MAX_HOLD_SHARE)))
+
+            while moved_from_node < dispatch_budget and queue and inspected < max_inspected:
+                inspected += 1
                 shipment = queue[0]
-                hop = self._agent.next_hop(shipment.current_node, shipment.destination)
+                extra_cost = 0.0
+
+                if self._agent_mode == "with_c":
+                    node_pressure, node_projected_pressure, node_flow_trend = self._pressure_maps()
+                    decision = self._with_c_agent.decide(
+                        source=shipment.current_node,
+                        destination=shipment.destination,
+                        priority=shipment.priority,
+                        node_pressure=node_pressure,
+                        node_projected_pressure=node_projected_pressure,
+                        node_flow_trend=node_flow_trend,
+                    )
+                    chosen_hop: PlannedHop | None = decision.hop
+                    if chosen_hop is not None and not self._node_can_accept(chosen_hop.target, shipment.load):
+                        ranked = self._with_c_agent.ranked_hops(
+                            source=shipment.current_node,
+                            destination=shipment.destination,
+                            priority=shipment.priority,
+                            node_pressure=node_pressure,
+                            node_projected_pressure=node_projected_pressure,
+                            node_flow_trend=node_flow_trend,
+                        )
+                        chosen_hop = None
+                        for item in ranked:
+                            candidate_hop = item[4]
+                            if self._node_can_accept(candidate_hop.target, shipment.load):
+                                chosen_hop = candidate_hop
+                                extra_cost = item[1]
+                                break
+
+                    if decision.action == "hold" or chosen_hop is None:
+                        source_projected_pressure = node_projected_pressure.get(node_id, 0.0)
+                        should_force_forward = (
+                            source_projected_pressure >= self.WITH_C_FORCE_FORWARD_SOURCE_PRESSURE
+                            or held_from_node >= hold_cap
+                        )
+                        if should_force_forward:
+                            forced_hop = self._without_c_agent.next_hop(shipment.current_node, shipment.destination)
+                            if forced_hop is not None:
+                                hop = forced_hop
+                            else:
+                                queue.rotate(-1)
+                                held_from_node += 1
+                                continue
+                        else:
+                            queue.rotate(-1)
+                            held_from_node += 1
+                            continue
+                    else:
+                        hop = chosen_hop
+                        extra_cost = decision.expected_extra_cost
+                else:
+                    hop = self._without_c_agent.next_hop(shipment.current_node, shipment.destination)
+                    if hop is not None and not self._node_can_accept(hop.target, shipment.load):
+                        hop = self._find_feasible_without_c_hop(shipment.current_node, shipment.destination, shipment.load)
+
                 if hop is None:
-                    queue.popleft()
-                    hold_ticks = self._hold_ticks_for_destination(shipment.destination, shipment.load)
-                    self._holding.append(HoldingShipment(shipment=shipment, node_id=shipment.destination, remaining_hold_ticks=hold_ticks))
-                    lane_counters[(shipment.current_node, shipment.destination)] += 1
-                    moved_count += 1
-                    moved_load += shipment.load
-                    moved_from_node += 1
+                    if shipment.current_node == shipment.destination:
+                        queue.popleft()
+                        hold_ticks = self._hold_ticks_for_destination(shipment.destination, shipment.load)
+                        self._holding.append(HoldingShipment(shipment=shipment, node_id=shipment.destination, remaining_hold_ticks=hold_ticks))
+                        lane_counters[(shipment.current_node, shipment.destination)] += 1
+                        moved_count += 1
+                        moved_load += shipment.load
+                        moved_from_node += 1
+                    else:
+                        queue.rotate(-1)
+                        held_from_node += 1
+                        self._push_log(
+                            f"route unavailable for {shipment.id} at {self._node_name.get(node_id, node_id)}; keeping shipment queued"
+                        )
                     continue
 
                 if not self._is_edge_valid(hop):
                     queue.popleft()
+                    self._dropped_shipments_total += 1
                     self._push_log(
                         f"dropped {shipment.id}: no valid edge from {self._node_name.get(shipment.current_node, shipment.current_node)}"
                     )
                     continue
 
                 if not self._node_can_accept(hop.target, shipment.load):
+                    if self._agent_mode == "with_c":
+                        queue.rotate(-1)
+                        held_from_node += 1
+                        continue
                     if moved_from_node == 0:
                         self._push_log(
                             f"blocked at {self._node_name.get(node_id, node_id)}: next node {self._node_name.get(hop.target, hop.target)} is full"
@@ -344,7 +481,12 @@ class SimulatorCore:
                 lane_counters[(shipment.current_node, hop.target)] += 1
                 moved_count += 1
                 moved_load += shipment.load
+                if self._agent_mode == "with_c":
+                    self._additional_cost += extra_cost
                 moved_from_node += 1
+
+            if held_from_node > 0:
+                self._push_log(f"held {held_from_node} shipments at {self._node_name.get(node_id, node_id)} to avoid downstream pressure")
 
         for (source, target), count_value in lane_counters.items():
             self._push_log(
@@ -355,6 +497,51 @@ class SimulatorCore:
         self._last_edge_move_loads = {edge_id: round(value, 2) for edge_id, value in edge_move_loads.items()}
 
         return moved_count, moved_load
+
+    def _prioritize_queue(self, node_id: str) -> None:
+        queue = self._queues.get(node_id)
+        if queue is None or len(queue) < 2:
+            return
+        ordered = sorted(queue, key=lambda shipment: (self._priority_rank(shipment.priority), shipment.deadline_tick, shipment.id))
+        queue.clear()
+        queue.extend(ordered)
+
+    def _priority_rank(self, priority: ShipmentPriority) -> int:
+        if priority == ShipmentPriority.CRITICAL:
+            return 0
+        if priority == ShipmentPriority.HIGH:
+            return 1
+        if priority == ShipmentPriority.MEDIUM:
+            return 2
+        return 3
+
+    def _pressure_maps(self) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        inbound_load: dict[str, float] = defaultdict(float)
+        outbound_load: dict[str, float] = defaultdict(float)
+        pending_load: dict[str, float] = defaultdict(float)
+
+        for transit in self._in_transit:
+            inbound_load[transit.target] += transit.shipment.load
+            outbound_load[transit.source] += transit.shipment.load
+
+        for node_id, pending in self._pending_admission.items():
+            pending_load[node_id] = sum(item.load for item in pending)
+
+        pressure: dict[str, float] = {}
+        projected: dict[str, float] = {}
+        flow_trend: dict[str, float] = {}
+        for node in self._world.nodes:
+            current = self._node_operational_load(node.id)
+            cap = max(1.0, node.capacity)
+            inbound = inbound_load.get(node.id, 0.0)
+            outbound = outbound_load.get(node.id, 0.0)
+            pending = pending_load.get(node.id, 0.0)
+
+            pressure[node.id] = (current + 0.35 * inbound + 0.15 * pending) / cap
+            projected[node.id] = max(0.0, current + inbound + pending - 0.35 * outbound) / cap
+            flow_trend[node.id] = (inbound - outbound + pending) / cap
+
+        return pressure, projected, flow_trend
 
     def _advance_transit(self) -> None:
         if not self._in_transit:
@@ -440,7 +627,7 @@ class SimulatorCore:
         node = self._node_by_id.get(node_id)
         if node is None:
             return False
-        return self._node_current_load(node_id) + incoming_load <= node.capacity
+        return self._node_operational_load(node_id) + incoming_load <= node.capacity
 
     def _count_full_nodes(self) -> int:
         return len(self._full_node_ids())
@@ -448,7 +635,7 @@ class SimulatorCore:
     def _full_node_ids(self) -> list[str]:
         full_node_ids: list[str] = []
         for node in self._world.nodes:
-            if self._node_current_load(node.id) >= node.capacity * self.FULL_NODE_UTILIZATION_THRESHOLD:
+            if self._node_failure_load(node.id) >= node.capacity * self.FULL_NODE_UTILIZATION_THRESHOLD:
                 full_node_ids.append(node.id)
         return full_node_ids
 
@@ -459,6 +646,11 @@ class SimulatorCore:
         full_node_ids = self._full_node_ids()
         full_nodes = len(full_node_ids)
         if full_nodes > self.FAILURE_FULL_NODE_THRESHOLD:
+            self._overload_streak += 1
+        else:
+            self._overload_streak = 0
+
+        if self._overload_streak >= self.FAILURE_SUSTAINED_TICKS:
             failed_names = [self._node_name.get(node_id, node_id) for node_id in full_node_ids]
             reason = f"system failed: {full_nodes} nodes reached capacity"
             if self._failure_reason == reason:
@@ -475,7 +667,129 @@ class SimulatorCore:
         holding_load = sum(item.shipment.load for item in self._holding if item.node_id == node_id)
         return queue_load + holding_load
 
+    def _dynamic_dispatch_budget(self, node_id: str, base_budget: int) -> int:
+        node = self._node_by_id.get(node_id)
+        if node is None:
+            return base_budget
+        queue_load = sum(shipment.load for shipment in self._queues.get(node_id, deque()))
+        util = queue_load / max(1.0, node.capacity)
+        if util <= self.QUEUE_DISPATCH_SOFT_THRESHOLD:
+            return base_budget
+        over = util - self.QUEUE_DISPATCH_SOFT_THRESHOLD
+        boost = 1.0 + min(self.MAX_QUEUE_DISPATCH_BOOST - 1.0, (over / 0.55) * 2.0)
+        return max(base_budget, int(math.ceil(base_budget * boost)))
+
+    def _find_feasible_without_c_hop(self, source: str, destination: str, load: float) -> PlannedHop | None:
+        ranked: list[tuple[float, int, PlannedHop]] = []
+        for edge in self._world.edges:
+            if edge.source != source:
+                continue
+            hop = PlannedHop(source=edge.source, target=edge.target, base_eta=edge.base_eta, base_cost=edge.base_cost)
+            next_hop = self._without_c_agent.next_hop(hop.target, destination)
+            if hop.target != destination and next_hop is None:
+                continue
+            score_cost = hop.base_cost + (next_hop.base_cost if next_hop is not None else 0.0)
+            score_eta = hop.base_eta + (next_hop.base_eta if next_hop is not None else 0)
+            ranked.append((score_cost, score_eta, hop))
+
+        ranked.sort(key=lambda item: (item[0], item[1], item[2].target))
+        for _, _, hop in ranked:
+            if self._node_can_accept(hop.target, load):
+                return hop
+        return None
+
+    def _node_physical_load(self, node_id: str) -> float:
+        return self._node_current_load(node_id)
+
+    def _node_operational_load(self, node_id: str) -> float:
+        queue_load = sum(shipment.load for shipment in self._queues.get(node_id, deque()))
+        holding_load = sum(item.shipment.load for item in self._holding if item.node_id == node_id)
+        return queue_load + (self.HOLDING_ADMISSION_WEIGHT * holding_load)
+
+    def _node_failure_load(self, node_id: str) -> float:
+        queue_load = sum(shipment.load for shipment in self._queues.get(node_id, deque()))
+        holding_load = sum(item.shipment.load for item in self._holding if item.node_id == node_id)
+        current_load = queue_load + (self.HOLDING_FAILURE_WEIGHT * holding_load)
+        pending_load = sum(item.load for item in self._pending_admission.get(node_id, deque()))
+        stalled_gate_load = sum(
+            transit.shipment.load
+            for transit in self._in_transit
+            if transit.target == node_id and transit.stalled
+        )
+        return current_load + (self.PENDING_FAILURE_WEIGHT * pending_load) + stalled_gate_load
+
     def _push_log(self, message: str) -> None:
         self._recent_logs.insert(0, SimulationLog(tick=self._tick, message=message))
         if len(self._recent_logs) > 250:
             self._recent_logs = self._recent_logs[:250]
+
+    def _validate_mass_balance(self) -> None:
+        queue_count = 0
+        in_transit_count = len(self._in_transit)
+        holding_count = len(self._holding)
+        pending_count = 0
+
+        seen: dict[str, str] = {}
+        duplicates: list[str] = []
+
+        for node_id, queue in self._queues.items():
+            for shipment in queue:
+                queue_count += 1
+                previous = seen.get(shipment.id)
+                location = f"queue:{node_id}"
+                if previous is not None:
+                    duplicates.append(f"{shipment.id}({previous},{location})")
+                else:
+                    seen[shipment.id] = location
+
+        for transit in self._in_transit:
+            previous = seen.get(transit.shipment.id)
+            location = f"in_transit:{transit.source}->{transit.target}"
+            if previous is not None:
+                duplicates.append(f"{transit.shipment.id}({previous},{location})")
+            else:
+                seen[transit.shipment.id] = location
+
+        for item in self._holding:
+            previous = seen.get(item.shipment.id)
+            location = f"holding:{item.node_id}"
+            if previous is not None:
+                duplicates.append(f"{item.shipment.id}({previous},{location})")
+            else:
+                seen[item.shipment.id] = location
+
+        for node_id, pending in self._pending_admission.items():
+            for shipment in pending:
+                pending_count += 1
+                previous = seen.get(shipment.id)
+                location = f"pending:{node_id}"
+                if previous is not None:
+                    duplicates.append(f"{shipment.id}({previous},{location})")
+                else:
+                    seen[shipment.id] = location
+
+        if duplicates:
+            preview = ", ".join(duplicates[:5])
+            reason = f"data integrity error: duplicate shipment ids across states ({preview})"
+            self._failed = True
+            self._running = False
+            self._failure_reason = reason
+            self._demand_generator.set_running(False)
+            self._push_log(reason)
+            return
+
+        live_count = queue_count + in_transit_count + holding_count + pending_count
+        expected_total = self._ingested_shipments_total
+        accounted_total = live_count + self._consumed_shipments + self._dropped_shipments_total
+
+        if accounted_total != expected_total:
+            reason = (
+                "data integrity error: shipment mass mismatch "
+                f"(expected={expected_total}, accounted={accounted_total}, live={live_count}, "
+                f"consumed={self._consumed_shipments}, dropped={self._dropped_shipments_total})"
+            )
+            self._failed = True
+            self._running = False
+            self._failure_reason = reason
+            self._demand_generator.set_running(False)
+            self._push_log(reason)

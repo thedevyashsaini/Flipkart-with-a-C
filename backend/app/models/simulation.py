@@ -29,6 +29,7 @@ class EdgeSimulationStat(BaseModel):
 
 
 class SimulationState(BaseModel):
+    agent_mode: str = "without_c"
     tick: int = Field(ge=0)
     running: bool = False
     failed: bool = False
@@ -43,6 +44,8 @@ class SimulationState(BaseModel):
     in_transit_shipments: int = Field(ge=0)
     holding_shipments: int = Field(ge=0)
     consumed_shipments: int = Field(ge=0)
+    additional_cost: float = Field(ge=0)
+    additional_cost_threshold: float = Field(ge=0)
     node_stats: dict[str, NodeSimulationStat]
     edge_stats: dict[str, EdgeSimulationStat]
     recent_logs: list[SimulationLog]

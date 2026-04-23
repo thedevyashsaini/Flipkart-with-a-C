@@ -392,6 +392,7 @@ export default function Page() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [selectedEdgeCorridor, setSelectedEdgeCorridor] = useState<string | null>(null)
   const [injectingNodeId, setInjectingNodeId] = useState<string | null>(null)
+  const [agentMode, setAgentMode] = useState<"without_c" | "with_c">("without_c")
   const [seedInput, setSeedInput] = useState("42")
   const [tickInput, setTickInput] = useState("0")
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<NodeData>>([])
@@ -402,6 +403,10 @@ export default function Page() {
   const logSeqRef = useRef(1)
   const streamReadyRef = useRef(false)
   const seedInitializedRef = useRef(false)
+  const agentSliderRef = useRef<HTMLDivElement | null>(null)
+  const agentDragStartXRef = useRef(0)
+  const agentDragStartOffsetRef = useRef(0)
+  const [agentDragOffset, setAgentDragOffset] = useState<number | null>(null)
 
   const selectedNodeDetails = useMemo(
     () => toSelectedNodeDetails(world, simState, selectedNodeId),
@@ -534,7 +539,7 @@ export default function Page() {
         setTickInput(String(normalizedTick))
 
         requestInit.headers = { "Content-Type": "application/json" }
-        requestInit.body = JSON.stringify({ seed: normalizedSeed, tick: normalizedTick })
+        requestInit.body = JSON.stringify({ seed: normalizedSeed, tick: normalizedTick, agent_mode: agentMode })
       }
 
       const response = await fetch(`${API_BASE}/sim/${action}`, requestInit)
@@ -560,6 +565,25 @@ export default function Page() {
     }
   }
 
+  async function updateAgentMode(nextMode: "without_c" | "with_c") {
+    if (nextMode === agentMode) {
+      return
+    }
+    setAgentMode(nextMode)
+    try {
+      const response = await fetch(`${API_BASE}/sim/agent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agent_mode: nextMode }),
+      })
+      if (!response.ok) {
+        throw new Error(`agent switch failed (${response.status})`)
+      }
+    } catch (err) {
+      setSimStreamError((err as Error).message)
+    }
+  }
+
   async function injectNodeLoad(nodeId: string) {
     try {
       setInjectingNodeId(nodeId)
@@ -582,6 +606,7 @@ export default function Page() {
       try {
         const payload = JSON.parse(event.data) as SimulationState
         setSimState(payload)
+        setAgentMode(payload.agent_mode)
         if (payload.running) {
           setTickInput(String(payload.tick))
         }
@@ -656,7 +681,7 @@ export default function Page() {
           <div className="flex h-full">
             <aside className="flex w-60 flex-col border-r border-border/80 bg-card/95">
               <div className="border-b border-border/70 px-3 py-2 text-xs font-medium tracking-[0.08em] text-muted-foreground md:text-sm">DEMAND GENERATOR</div>
-              <div className="grid grid-cols-2 gap-2 border-b border-border/70 p-3 text-xs">
+                <div className="grid grid-cols-2 gap-2 border-b border-border/70 p-3 text-xs">
                 <div className="rounded-none border border-border/70 bg-background/40 p-2">
                   <div className="text-[10px] text-muted-foreground">Tick</div>
                   <div className="text-sm font-semibold">{demand?.tick ?? 0}</div>
@@ -748,7 +773,95 @@ export default function Page() {
             </div>
 
             <aside className="flex w-64 flex-col border-l border-border/80 bg-card/95">
-              <div className="border-b border-border/70 px-3 py-2 text-xs font-medium tracking-[0.08em] text-muted-foreground md:text-sm">WITHOUT A C AGENT</div>
+              <div className="flex items-center border-b border-border/70">
+                <div
+                  ref={agentSliderRef}
+                  className="relative h-10 w-full cursor-ew-resize select-none overflow-hidden rounded-none border border-border/70 bg-card/95"
+                  onPointerDown={event => {
+                    event.preventDefault()
+                    const width = event.currentTarget.getBoundingClientRect().width
+                    const baseOffset = agentMode === "with_c" ? -width : 0
+                    agentDragStartXRef.current = event.clientX
+                    agentDragStartOffsetRef.current = agentDragOffset ?? baseOffset
+                    event.currentTarget.setPointerCapture(event.pointerId)
+                  }}
+                  onPointerMove={event => {
+                    if (!event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      return
+                    }
+                    const width = event.currentTarget.getBoundingClientRect().width
+                    const delta = event.clientX - agentDragStartXRef.current
+                    const nextOffset = Math.max(-width, Math.min(0, agentDragStartOffsetRef.current + delta))
+                    setAgentDragOffset(nextOffset)
+                  }}
+                  onPointerUp={event => {
+                    const width = event.currentTarget.getBoundingClientRect().width
+                    const baseOffset = agentMode === "with_c" ? -width : 0
+                    const settledOffset = agentDragOffset ?? baseOffset
+                    const nextMode = settledOffset <= -width / 2 ? "with_c" : "without_c"
+                    setAgentDragOffset(null)
+                    void updateAgentMode(nextMode)
+                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      event.currentTarget.releasePointerCapture(event.pointerId)
+                    }
+                  }}
+                  onPointerCancel={event => {
+                    setAgentDragOffset(null)
+                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      event.currentTarget.releasePointerCapture(event.pointerId)
+                    }
+                  }}
+                  title={agentMode === "with_c" ? "Drag right to switch back" : "Drag left to switch to with c"}
+                >
+                  <div
+                    className={`absolute inset-y-0 left-0 flex w-[200%] select-none items-center whitespace-nowrap px-4 text-xs font-medium tracking-[0.08em] text-foreground transition-transform md:text-sm ${agentDragOffset === null ? "duration-200" : "duration-0"}`}
+                    style={{
+                      transform: agentDragOffset === null
+                        ? `translateX(${agentMode === "with_c" ? "-50%" : "0%"})`
+                        : `translateX(${agentDragOffset}px)`,
+                    }}
+                  >
+                    <div className="flex h-full w-1/2 items-center justify-end text-right">
+                      WITHOUT C AGENT
+                      <button
+                        type="button"
+                        className="ml-2 cursor-pointer select-none"
+                        onPointerDown={event => {
+                          event.stopPropagation()
+                        }}
+                        onPointerUp={event => {
+                          event.stopPropagation()
+                        }}
+                        onClick={event => {
+                          event.stopPropagation()
+                          void updateAgentMode("with_c")
+                        }}
+                      >
+                        &lt;&lt;
+                      </button>
+                    </div>
+                    <div className="flex h-full w-1/2 items-center">
+                      <button
+                        type="button"
+                        className="mr-2 cursor-pointer select-none"
+                        onPointerDown={event => {
+                          event.stopPropagation()
+                        }}
+                        onPointerUp={event => {
+                          event.stopPropagation()
+                        }}
+                        onClick={event => {
+                          event.stopPropagation()
+                          void updateAgentMode("without_c")
+                        }}
+                      >
+                        &gt;&gt;
+                      </button>
+                      WITH C AGENT
+                    </div>
+                  </div>
+                </div>
+              </div>
                 <div className="grid grid-cols-2 gap-1 border-b border-border/70 p-2">
                   <label className="flex flex-col gap-1 text-[10px] text-muted-foreground">
                     <span>Seed</span>
