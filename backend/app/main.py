@@ -1,24 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import io
 import json
 import os
 import random
+import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from google.cloud import firestore
+from google.oauth2 import service_account
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 from pydantic import BaseModel, Field
 
+from app.agents.with_c import WithCAgent
 from app.demand_generator import DemandGenerator
-from app.models import DemandState, SimulationState, World
+from app.models import DemandState, ShipmentPriority, SimulationState, World
 from app.simulator_core import SimulatorCore
 
 app = FastAPI()
@@ -36,6 +45,9 @@ ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 demand_generator: DemandGenerator | None = None
 simulator_core: SimulatorCore | None = None
 explanation_cache: dict[int, str] = {}
+live_explanation_cache: dict[str, str] = {}
+firestore_client: firestore.Client | None = None
+with_c_agent_cache: dict[str, WithCAgent] = {}
 
 
 def load_env_file() -> None:
@@ -149,19 +161,270 @@ class ExplainLogRequest(BaseModel):
     log_id: int = Field(ge=1)
 
 
+class LiveNodeCreate(BaseModel):
+    id: str
+    name: str
+    type: str
+    region: str
+    capacity: float = Field(gt=0)
+    avg_hold_ticks_per_ton: float = Field(ge=0)
+    x: float
+    y: float
+
+
+class LiveEdgeCreate(BaseModel):
+    id: str
+    source: str
+    target: str
+    base_eta: int = Field(ge=1)
+    base_cost: float = Field(ge=0)
+
+
+class LiveChainCreateRequest(BaseModel):
+    chain_name: str
+    nodes: list[LiveNodeCreate]
+    edges: list[LiveEdgeCreate]
+
+
+class LiveNodeTokenResult(BaseModel):
+    node_id: str
+    api_token: str
+
+
+class LiveChainCreateResponse(BaseModel):
+    ok: bool
+    chain_id: str
+    node_tokens: list[LiveNodeTokenResult]
+
+
+class LiveNodeEventRequest(BaseModel):
+    event_type: Literal["shipment_created", "shipment_arrived", "shipment_dispatched", "shipment_delivered", "shipment_held", "shipment_rerouted", "node_status"]
+    shipment_id: str
+    source_node_id: str | None = None
+    destination_node_id: str | None = None
+    current_node_id: str
+    load: float | None = Field(default=None, gt=0)
+    priority: ShipmentPriority | None = ShipmentPriority.MEDIUM
+    deadline_tick: int | None = Field(default=None, ge=0)
+    timestamp_iso: str | None = None
+
+
+class LiveExplainDecisionRequest(BaseModel):
+    chain_id: str
+    decision_id: str
+
+
+class LiveTimelineItem(BaseModel):
+    id: str
+    kind: Literal["suggestion", "event"]
+    created_at: str
+    message: str
+    decision_id: str | None = None
+    event_type: str | None = None
+
+
 def load_world() -> World:
     raw = json.loads(WORLD_PATH.read_text(encoding="utf-8"))
     return World.model_validate(raw)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def require_firestore() -> firestore.Client:
+    if firestore_client is None:
+        raise HTTPException(status_code=503, detail="Firestore is not configured")
+    return firestore_client
+
+
+def generate_node_token() -> str:
+    return secrets.token_urlsafe(36)
+
+
+def token_hash(token: str) -> str:
+    signing_secret = os.getenv("TOKEN_SIGNING_SECRET", "").strip()
+    if not signing_secret:
+        raise HTTPException(status_code=503, detail="TOKEN_SIGNING_SECRET is not configured")
+    return hmac.new(signing_secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def require_admin_key(x_admin_api_key: str | None) -> None:
+    expected = os.getenv("SUPPLY_ADMIN_API_KEY", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="SUPPLY_ADMIN_API_KEY is not configured")
+    provided = (x_admin_api_key or "").strip()
+    if provided != expected:
+        raise HTTPException(status_code=401, detail="Invalid supply admin API key")
+
+
+def is_valid_admin_key(x_admin_api_key: str | None) -> bool:
+    expected = os.getenv("SUPPLY_ADMIN_API_KEY", "").strip()
+    if not expected:
+        return False
+    return (x_admin_api_key or "").strip() == expected
+
+
+def parse_bearer_token(auth_header: str | None) -> str:
+    value = (auth_header or "").strip()
+    if not value.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = value[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    return token
+
+
+def load_live_chain(client: firestore.Client, chain_id: str) -> dict[str, object]:
+    chain_ref = client.collection("supply_chains").document(chain_id)
+    chain_doc = chain_ref.get()
+    if not chain_doc.exists:
+        raise HTTPException(status_code=404, detail="Chain not found")
+
+    nodes = [doc.to_dict() for doc in chain_ref.collection("nodes").stream()]
+    edges = [doc.to_dict() for doc in chain_ref.collection("edges").stream()]
+    if not nodes:
+        raise HTTPException(status_code=400, detail="Chain has no nodes")
+    if not edges:
+        raise HTTPException(status_code=400, detail="Chain has no edges")
+
+    return {
+        "chain": chain_doc.to_dict(),
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def live_agent(chain_id: str, nodes: list[dict[str, object]], edges: list[dict[str, object]]) -> WithCAgent:
+    cached = with_c_agent_cache.get(chain_id)
+    if cached is not None:
+        return cached
+    world = World.model_validate({"nodes": nodes, "edges": edges})
+    agent = WithCAgent(world)
+    with_c_agent_cache[chain_id] = agent
+    return agent
+
+
+def load_recent_shipments(client: firestore.Client, chain_id: str) -> dict[str, dict[str, object]]:
+    shipments: dict[str, dict[str, object]] = {}
+    docs = (
+        client.collection("supply_chains")
+        .document(chain_id)
+        .collection("shipments")
+        .order_by("updated_at", direction=firestore.Query.DESCENDING)
+        .limit(3000)
+        .stream()
+    )
+    for doc in docs:
+        shipments[doc.id] = doc.to_dict() or {}
+    return shipments
+
+
+def compute_pressure_maps_live(
+    *,
+    nodes: list[dict[str, object]],
+    edges: list[dict[str, object]],
+    shipments: dict[str, dict[str, object]],
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+    inbound: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
+    outbound: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
+    queued: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
+    holding: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
+    in_transit_to: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
+
+    for shipment in shipments.values():
+        state = str(shipment.get("state", "queued"))
+        node_id = str(shipment.get("current_node_id", ""))
+        load = float(shipment.get("load", 0.0) or 0.0)
+        if state == "holding":
+            if node_id in holding:
+                holding[node_id] += load
+            continue
+        if state == "in_transit":
+            target_id = str(shipment.get("target_node_id", ""))
+            source_id = str(shipment.get("source_node_id", ""))
+            if target_id in inbound:
+                inbound[target_id] += load
+                in_transit_to[target_id] += load
+            if source_id in outbound:
+                outbound[source_id] += load
+            continue
+        if state in {"queued", "arrived"} and node_id in queued:
+            queued[node_id] += load
+
+    pressure: dict[str, float] = {}
+    projected: dict[str, float] = {}
+    flow_trend: dict[str, float] = {}
+    for node in nodes:
+        node_id = str(node["id"])
+        cap = max(1.0, float(node.get("capacity", 1.0) or 1.0))
+        current = queued.get(node_id, 0.0) + 0.22 * holding.get(node_id, 0.0)
+        in_load = inbound.get(node_id, 0.0)
+        out_load = outbound.get(node_id, 0.0)
+        pressure[node_id] = (current + 0.35 * in_load) / cap
+        projected[node_id] = max(0.0, current + in_load - 0.35 * out_load) / cap
+        flow_trend[node_id] = (in_load - out_load) / cap
+
+    return pressure, projected, flow_trend
+
+
+def resolve_next_hop_live(
+    *,
+    chain_id: str,
+    nodes: list[dict[str, object]],
+    edges: list[dict[str, object]],
+    shipment: dict[str, object],
+    pressure: dict[str, float],
+    projected: dict[str, float],
+    trend: dict[str, float],
+) -> dict[str, object]:
+    agent = live_agent(chain_id, nodes, edges)
+    source = str(shipment.get("current_node_id", ""))
+    destination = str(shipment.get("destination_node_id", ""))
+    priority_raw = str(shipment.get("priority", "medium")).upper()
+    priority = ShipmentPriority[priority_raw] if priority_raw in ShipmentPriority.__members__ else ShipmentPriority.MEDIUM
+    decision = agent.decide(
+        source=source,
+        destination=destination,
+        priority=priority,
+        node_pressure=pressure,
+        node_projected_pressure=projected,
+        node_flow_trend=trend,
+    )
+    if decision.action == "hold" or decision.hop is None:
+        return {
+            "action": "hold",
+            "target_node_id": None,
+            "reason": decision.reason,
+            "expected_extra_cost": decision.expected_extra_cost,
+        }
+    return {
+        "action": "move",
+        "target_node_id": decision.hop.target,
+        "reason": decision.reason,
+        "expected_extra_cost": decision.expected_extra_cost,
+    }
 
 
 @app.on_event("startup")
 def startup() -> None:
     global demand_generator
     global simulator_core
+    global firestore_client
     world_data = load_world()
     demand_generator = DemandGenerator(world=world_data, seed=42, tick_interval_sec=1.0, window_size=600)
     simulator_core = SimulatorCore(world=world_data, demand_generator=demand_generator, tick_interval_sec=1.0)
     simulator_core.start()
+
+    project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+    svc_raw = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
+    if project_id and svc_raw:
+        try:
+            svc_info = json.loads(svc_raw)
+            credentials = service_account.Credentials.from_service_account_info(svc_info)
+            firestore_client = firestore.Client(project=project_id, credentials=credentials)
+        except Exception:
+            firestore_client = None
 
 @app.get("/")
 def root():
@@ -512,8 +775,6 @@ def simulation_explain_log(payload: ExplainLogRequest) -> dict[str, str | int | 
     for candidate in data.get("candidates", []):
         content = candidate.get("content", {})
         for part in content.get("parts", []):
-            if part.get("thought") or part.get("thoughtSignature"):
-                continue
             text = part.get("text", "")
             if text:
                 explanation = text.strip()
@@ -534,6 +795,528 @@ def simulation_explain_log(payload: ExplainLogRequest) -> dict[str, str | int | 
 
     explanation_cache[payload.log_id] = explanation
     return {"ok": True, "log_id": payload.log_id, "explanation": explanation, "cached": False}
+
+
+@app.post("/live/chains", response_model=LiveChainCreateResponse)
+def live_create_chain(payload: LiveChainCreateRequest, x_admin_api_key: str | None = Header(default=None)) -> LiveChainCreateResponse:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+
+    node_ids = {node.id for node in payload.nodes}
+    if len(node_ids) != len(payload.nodes):
+        raise HTTPException(status_code=400, detail="Duplicate node id in request")
+    for edge in payload.edges:
+        if edge.source not in node_ids or edge.target not in node_ids:
+            raise HTTPException(status_code=400, detail=f"Edge {edge.id} references unknown nodes")
+
+    chain_id = f"ch_{uuid4().hex[:10]}"
+    chain_ref = client.collection("supply_chains").document(chain_id)
+    chain_ref.set(
+        {
+            "chain_id": chain_id,
+            "chain_name": payload.chain_name,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "status": "active",
+        }
+    )
+
+    node_tokens: list[LiveNodeTokenResult] = []
+    for node in payload.nodes:
+        plain_token = generate_node_token()
+        node_tokens.append(LiveNodeTokenResult(node_id=node.id, api_token=plain_token))
+        node_doc = node.model_dump()
+        node_doc.update(
+            {
+                "token_hash": token_hash(plain_token),
+                "token_last4": plain_token[-4:],
+                "enabled": True,
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+        )
+        chain_ref.collection("nodes").document(node.id).set(node_doc)
+
+    for edge in payload.edges:
+        edge_doc = edge.model_dump()
+        edge_doc.update({"created_at": now_iso(), "updated_at": now_iso()})
+        chain_ref.collection("edges").document(edge.id).set(edge_doc)
+
+    with_c_agent_cache.pop(chain_id, None)
+    return LiveChainCreateResponse(ok=True, chain_id=chain_id, node_tokens=node_tokens)
+
+
+@app.post("/live/chains/{chain_id}/nodes/{node_id}/token")
+def live_rotate_node_token(chain_id: str, node_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, str | bool]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    node_ref = client.collection("supply_chains").document(chain_id).collection("nodes").document(node_id)
+    node_doc = node_ref.get()
+    if not node_doc.exists:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    plain_token = generate_node_token()
+    node_ref.update(
+        {
+            "token_hash": token_hash(plain_token),
+            "token_last4": plain_token[-4:],
+            "updated_at": now_iso(),
+        }
+    )
+    return {"ok": True, "node_id": node_id, "api_token": plain_token}
+
+
+@app.delete("/live/chains/{chain_id}")
+def live_delete_chain(chain_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, str | bool]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    chain_ref = client.collection("supply_chains").document(chain_id)
+    chain_doc = chain_ref.get()
+    if not chain_doc.exists:
+        raise HTTPException(status_code=404, detail="Chain not found")
+
+    client.recursive_delete(chain_ref)
+    with_c_agent_cache.pop(chain_id, None)
+    return {"ok": True, "chain_id": chain_id}
+
+
+@app.get("/live/chains/{chain_id}/snapshot")
+def live_chain_snapshot(chain_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    live = load_live_chain(client, chain_id)
+    shipments = load_recent_shipments(client, chain_id)
+    recent_logs = [doc.to_dict() for doc in client.collection("supply_chains").document(chain_id).collection("decisions").order_by("tick", direction=firestore.Query.DESCENDING).limit(120).stream()]
+    return {
+        "ok": True,
+        "chain_id": chain_id,
+        "chain": live["chain"],
+        "nodes": live["nodes"],
+        "edges": live["edges"],
+        "shipments": list(shipments.values()),
+        "recent_logs": recent_logs,
+    }
+
+
+@app.get("/live/chains/{chain_id}/logs")
+def live_chain_logs(chain_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    logs = [
+        doc.to_dict()
+        for doc in client.collection("supply_chains")
+        .document(chain_id)
+        .collection("decisions")
+        .order_by("tick", direction=firestore.Query.DESCENDING)
+        .limit(150)
+        .stream()
+    ]
+    return {"ok": True, "chain_id": chain_id, "logs": logs}
+
+
+@app.get("/live/chains/{chain_id}/events")
+def live_chain_events(chain_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    events = [
+        doc.to_dict()
+        for doc in client.collection("supply_chains")
+        .document(chain_id)
+        .collection("events")
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(200)
+        .stream()
+    ]
+    return {"ok": True, "chain_id": chain_id, "events": events}
+
+
+@app.get("/live/chains/{chain_id}/suggestions")
+def live_chain_suggestions(chain_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    suggestions = [
+        doc.to_dict()
+        for doc in client.collection("supply_chains")
+        .document(chain_id)
+        .collection("decisions")
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(120)
+        .stream()
+    ]
+    return {"ok": True, "chain_id": chain_id, "suggestions": suggestions}
+
+
+@app.get("/live/chains/{chain_id}/shipments/search")
+def live_search_shipments(chain_id: str, q: str = "", x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    needle = q.strip().lower()
+    docs = (
+        client.collection("supply_chains")
+        .document(chain_id)
+        .collection("shipments")
+        .order_by("updated_at", direction=firestore.Query.DESCENDING)
+        .limit(500)
+        .stream()
+    )
+    ids: list[str] = []
+    for doc in docs:
+        shipment_id = doc.id
+        if not needle or needle in shipment_id.lower():
+            ids.append(shipment_id)
+        if len(ids) >= 40:
+            break
+    return {"ok": True, "chain_id": chain_id, "shipment_ids": ids}
+
+
+@app.get("/live/chains/{chain_id}/nodes/{node_id}/tasks")
+def live_node_tasks(
+    chain_id: str,
+    node_id: str,
+    authorization: str | None = Header(default=None),
+    x_admin_api_key: str | None = Header(default=None),
+) -> dict[str, object]:
+    client = require_firestore()
+    admin_mode = is_valid_admin_key(x_admin_api_key)
+    token = ""
+    if not admin_mode:
+        token = parse_bearer_token(authorization)
+    node_ref = client.collection("supply_chains").document(chain_id).collection("nodes").document(node_id)
+    node_doc = node_ref.get()
+    if not node_doc.exists:
+        raise HTTPException(status_code=404, detail="Node not found")
+    node_data = node_doc.to_dict() or {}
+    if not admin_mode and token_hash(token) != str(node_data.get("token_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid node token")
+
+    tasks = [
+        doc.to_dict()
+        for doc in client.collection("supply_chains")
+        .document(chain_id)
+        .collection("node_tasks")
+        .document(node_id)
+        .collection("tasks")
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(100)
+        .stream()
+    ]
+    return {"ok": True, "chain_id": chain_id, "node_id": node_id, "tasks": tasks}
+
+
+@app.get("/live/chains/{chain_id}/nodes/{node_id}/timeline")
+def live_node_timeline(
+    chain_id: str,
+    node_id: str,
+    authorization: str | None = Header(default=None),
+    x_admin_api_key: str | None = Header(default=None),
+) -> dict[str, object]:
+    client = require_firestore()
+    admin_mode = is_valid_admin_key(x_admin_api_key)
+    token = ""
+    if not admin_mode:
+        token = parse_bearer_token(authorization)
+    node_ref = client.collection("supply_chains").document(chain_id).collection("nodes").document(node_id)
+    node_doc = node_ref.get()
+    if not node_doc.exists:
+        raise HTTPException(status_code=404, detail="Node not found")
+    node_data = node_doc.to_dict() or {}
+    if not admin_mode and token_hash(token) != str(node_data.get("token_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid node token")
+
+    decisions = [
+        doc.to_dict()
+        for doc in client.collection("supply_chains")
+        .document(chain_id)
+        .collection("decisions")
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(300)
+        .stream()
+        if str((doc.to_dict() or {}).get("node_id", "")) == node_id
+    ][:120]
+    events = [
+        doc.to_dict()
+        for doc in client.collection("supply_chains")
+        .document(chain_id)
+        .collection("events")
+        .order_by("created_at", direction=firestore.Query.DESCENDING)
+        .limit(300)
+        .stream()
+        if str((doc.to_dict() or {}).get("node_id", "")) == node_id
+    ][:120]
+
+    items: list[LiveTimelineItem] = []
+    for decision in decisions:
+        items.append(
+            LiveTimelineItem(
+                id=str(decision.get("decision_id", "")),
+                kind="suggestion",
+                created_at=str(decision.get("created_at", "")),
+                message=str(decision.get("message", "")),
+                decision_id=str(decision.get("decision_id", "")),
+                event_type=None,
+            )
+        )
+    for event in events:
+        shipment_id = str(event.get("shipment_id", ""))
+        ev_type = str(event.get("event_type", ""))
+        items.append(
+            LiveTimelineItem(
+                id=str(event.get("event_id", "")),
+                kind="event",
+                created_at=str(event.get("created_at", "")),
+                message=f"{ev_type}: {shipment_id}" if shipment_id else ev_type,
+                decision_id=None,
+                event_type=ev_type,
+            )
+        )
+
+    items.sort(key=lambda item: item.created_at, reverse=True)
+    return {"ok": True, "chain_id": chain_id, "node_id": node_id, "timeline": [item.model_dump() for item in items[:200]]}
+
+
+@app.post("/live/events")
+def live_ingest_event(payload: LiveNodeEventRequest, authorization: str | None = Header(default=None)) -> dict[str, object]:
+    client = require_firestore()
+    token = parse_bearer_token(authorization)
+
+    # resolve node by token hash
+    token_digest = token_hash(token)
+    chain_doc_match = None
+    node_doc_match = None
+    for chain_doc in client.collection("supply_chains").stream():
+        matches = list(chain_doc.reference.collection("nodes").where("token_hash", "==", token_digest).limit(1).stream())
+        if matches:
+            chain_doc_match = chain_doc
+            node_doc_match = matches[0]
+            break
+    if chain_doc_match is None or node_doc_match is None:
+        raise HTTPException(status_code=401, detail="Invalid node token")
+
+    chain_id = chain_doc_match.id
+    node_id = node_doc_match.id
+    if payload.current_node_id != node_id:
+        raise HTTPException(status_code=400, detail="Token node and payload node mismatch")
+
+    chain_ref = client.collection("supply_chains").document(chain_id)
+    event_id = f"evt_{uuid4().hex[:12]}"
+    event_doc = payload.model_dump()
+    event_doc.update(
+        {
+            "event_id": event_id,
+            "chain_id": chain_id,
+            "node_id": node_id,
+            "created_at": now_iso(),
+        }
+    )
+    chain_ref.collection("events").document(event_id).set(event_doc)
+
+    shipment_ref = chain_ref.collection("shipments").document(payload.shipment_id)
+    shipment_existing = shipment_ref.get()
+    shipment_existing_data = shipment_existing.to_dict() or {}
+
+    if payload.event_type != "shipment_created" and not shipment_existing.exists:
+        raise HTTPException(status_code=404, detail="Shipment not found. Create it first.")
+
+    shipment_state = "queued"
+    if payload.event_type == "shipment_arrived":
+        shipment_state = "arrived"
+    elif payload.event_type in {"shipment_dispatched", "shipment_rerouted"}:
+        shipment_state = "in_transit"
+    elif payload.event_type == "shipment_held":
+        shipment_state = "holding"
+    elif payload.event_type == "shipment_delivered":
+        shipment_state = "delivered"
+    elif payload.event_type == "node_status":
+        shipment_state = str(shipment_existing_data.get("state", "queued") or "queued")
+
+    resolved_load = payload.load if payload.load is not None else shipment_existing_data.get("load")
+    if resolved_load is None:
+        raise HTTPException(status_code=400, detail="Load is required for shipment creation")
+
+    resolved_priority = payload.priority.value if payload.priority is not None else str(shipment_existing_data.get("priority", ShipmentPriority.MEDIUM.value))
+    resolved_deadline = payload.deadline_tick if payload.deadline_tick is not None else shipment_existing_data.get("deadline_tick")
+    if resolved_deadline is None:
+        resolved_deadline = 0
+
+    resolved_source = payload.source_node_id or str(shipment_existing_data.get("source_node_id", payload.current_node_id))
+    resolved_destination = payload.destination_node_id or str(shipment_existing_data.get("destination_node_id", payload.current_node_id))
+    resolved_target = payload.destination_node_id or str(shipment_existing_data.get("target_node_id", resolved_destination))
+
+    shipment_doc = {
+        "shipment_id": payload.shipment_id,
+        "source_node_id": resolved_source,
+        "destination_node_id": resolved_destination,
+        "current_node_id": payload.current_node_id,
+        "target_node_id": resolved_target,
+        "load": resolved_load,
+        "priority": resolved_priority,
+        "deadline_tick": resolved_deadline,
+        "state": shipment_state,
+        "updated_at": now_iso(),
+        "last_event_type": payload.event_type,
+    }
+    if not shipment_existing.exists:
+        shipment_doc["created_at"] = now_iso()
+    shipment_ref.set(shipment_doc, merge=True)
+
+    decision_id: str | None = None
+    task_id: str | None = None
+    next_action: dict[str, object] | None = None
+    should_plan_next_action = payload.event_type in {"shipment_created", "shipment_arrived", "node_status"}
+
+    if should_plan_next_action:
+        live = load_live_chain(client, chain_id)
+        shipments = load_recent_shipments(client, chain_id)
+        pressure, projected, trend = compute_pressure_maps_live(nodes=live["nodes"], edges=live["edges"], shipments=shipments)
+
+        current_shipment = shipments.get(payload.shipment_id, shipment_doc)
+        next_action = resolve_next_hop_live(
+            chain_id=chain_id,
+            nodes=live["nodes"],
+            edges=live["edges"],
+            shipment=current_shipment,
+            pressure=pressure,
+            projected=projected,
+            trend=trend,
+        )
+
+        decision_id = f"dec_{uuid4().hex[:12]}"
+        task_id = f"tsk_{uuid4().hex[:12]}"
+        task = {
+            "task_id": task_id,
+            "decision_id": decision_id,
+            "shipment_id": payload.shipment_id,
+            "action": next_action["action"],
+            "target_node_id": next_action["target_node_id"],
+            "reason": next_action["reason"],
+            "status": "pending",
+            "created_at": now_iso(),
+        }
+        chain_ref.collection("node_tasks").document(node_id).collection("tasks").document(task_id).set(task)
+
+        decision = {
+            "decision_id": decision_id,
+            "tick": int(datetime.now(timezone.utc).timestamp()),
+            "chain_id": chain_id,
+            "node_id": node_id,
+            "shipment_id": payload.shipment_id,
+            "action": next_action["action"],
+            "target_node_id": next_action["target_node_id"],
+            "reason": next_action["reason"],
+            "message": (
+                f"{node_id}: hold shipment {payload.shipment_id}"
+                if next_action["action"] == "hold"
+                else f"{node_id}: move shipment {payload.shipment_id} to {next_action['target_node_id']}"
+            ),
+            "counterfactual_context": {
+                "event": event_doc,
+                "shipment": current_shipment,
+                "next_action": next_action,
+                "pressure": pressure,
+                "projected_pressure": projected,
+                "flow_trend": trend,
+                "nodes": live["nodes"],
+                "edges": live["edges"],
+            },
+            "created_at": now_iso(),
+        }
+        chain_ref.collection("decisions").document(decision_id).set(decision)
+
+    return {
+        "ok": True,
+        "chain_id": chain_id,
+        "node_id": node_id,
+        "event_id": event_id,
+        "decision_id": decision_id,
+        "task_id": task_id,
+        "next_action": next_action,
+    }
+
+
+@app.post("/live/decisions/{decision_id}/explain")
+def live_explain_decision(decision_id: str, payload: LiveExplainDecisionRequest, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    cache_key = f"{payload.chain_id}:{decision_id}"
+    if cache_key in live_explanation_cache:
+        return {"ok": True, "decision_id": decision_id, "explanation": live_explanation_cache[cache_key], "cached": True}
+
+    decision_doc = (
+        client.collection("supply_chains")
+        .document(payload.chain_id)
+        .collection("decisions")
+        .document(decision_id)
+        .get()
+    )
+    if not decision_doc.exists:
+        raise HTTPException(status_code=404, detail="Decision not found")
+    decision = decision_doc.to_dict() or {}
+    context = decision.get("counterfactual_context")
+    if not context:
+        raise HTTPException(status_code=400, detail="Decision has no explainable context")
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite").strip() or "gemini-2.0-flash-lite"
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
+
+    prompt = (
+        "Explain why the recommended WITH C action is appropriate for this live supply-chain state. "
+        "Focus on pressure, congestion risk, and stability under uncertainty. "
+        "Return 3 short bullet points, plain text only.\n\n"
+        f"Decision message: {decision.get('message', '')}\n"
+        f"Decision reason: {decision.get('reason', '')}\n"
+        f"Structured context: {json.dumps(context, separators=(',', ':'))}"
+    )
+
+    request_body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "responseMimeType": "text/plain"},
+    }
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent?key={urllib.parse.quote(api_key, safe='')}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Gemini request failed: {detail}") from err
+    except urllib.error.URLError as err:
+        raise HTTPException(status_code=502, detail=f"Gemini request failed: {err.reason}") from err
+
+    explanation = ""
+    for candidate in data.get("candidates", []):
+        content = candidate.get("content", {})
+        for part in content.get("parts", []):
+            text = part.get("text", "")
+            if text:
+                explanation = text.strip()
+                break
+        if explanation:
+            break
+
+    if not explanation:
+        fallback_parts: list[str] = []
+        for candidate in data.get("candidates", []):
+            content = candidate.get("content", {})
+            for part in content.get("parts", []):
+                if part.get("thought") or part.get("thoughtSignature"):
+                    continue
+                text = str(part.get("text", "")).strip()
+                if text:
+                    fallback_parts.append(text)
+        explanation = "\n".join(fallback_parts).strip()
+
+    if not explanation:
+        raise HTTPException(status_code=502, detail="Gemini returned no explanation text")
+
+    live_explanation_cache[cache_key] = explanation
+    return {"ok": True, "decision_id": decision_id, "explanation": explanation, "cached": False}
 
 
 @app.post("/demand/inject/{node_id}")
