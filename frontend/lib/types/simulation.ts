@@ -1,6 +1,11 @@
 export type SimulationLog = {
+  log_id: number
   tick: number
   message: string
+  counterfactual_diff: boolean
+  counterfactual_agent: "with_c" | "without_c" | null
+  counterfactual_summary: string | null
+  counterfactual_context: Record<string, unknown> | null
 }
 
 export type NodeSimulationStat = {

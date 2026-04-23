@@ -77,6 +77,7 @@ class SimulatorCore:
 
         self._tick = 0
         self._shipment_seq = count(1)
+        self._log_seq = count(1)
         self._state_lock = threading.Lock()
 
         self._queues: dict[str, deque[SimShipment]] = defaultdict(deque)
@@ -149,6 +150,7 @@ class SimulatorCore:
             self._failure_reason = ""
             self._tick = 0
             self._shipment_seq = count(1)
+            self._log_seq = count(1)
             self._queues = defaultdict(deque)
             self._in_transit = []
             self._holding = []
@@ -392,6 +394,7 @@ class SimulatorCore:
         moved_count = 0
         moved_load = 0.0
         lane_counters: dict[tuple[str, str], int] = defaultdict(int)
+        lane_counterfactuals: dict[tuple[str, str], dict[str, object]] = {}
         edge_move_counts: dict[str, int] = defaultdict(int)
         edge_move_loads: dict[str, float] = defaultdict(float)
 
@@ -417,57 +420,36 @@ class SimulatorCore:
                 inspected += 1
                 shipment = queue[0]
                 extra_cost = 0.0
+                counterfactual_decision: dict[str, object] | None = None
 
                 if self._agent_mode == "with_c":
                     node_pressure, node_projected_pressure, node_flow_trend = self._pressure_maps()
-                    decision = self._with_c_agent.decide(
-                        source=shipment.current_node,
-                        destination=shipment.destination,
-                        priority=shipment.priority,
+                    resolved = self._resolve_with_c_decision(
+                        shipment=shipment,
+                        node_id=node_id,
+                        held_from_node=held_from_node,
+                        hold_cap=hold_cap,
                         node_pressure=node_pressure,
                         node_projected_pressure=node_projected_pressure,
                         node_flow_trend=node_flow_trend,
                     )
-                    chosen_hop: PlannedHop | None = decision.hop
-                    if chosen_hop is not None and not self._node_can_accept(chosen_hop.target, shipment.load):
-                        ranked = self._with_c_agent.ranked_hops(
-                            source=shipment.current_node,
-                            destination=shipment.destination,
-                            priority=shipment.priority,
-                            node_pressure=node_pressure,
-                            node_projected_pressure=node_projected_pressure,
-                            node_flow_trend=node_flow_trend,
-                        )
-                        chosen_hop = None
-                        for item in ranked:
-                            candidate_hop = item[4]
-                            if self._node_can_accept(candidate_hop.target, shipment.load):
-                                chosen_hop = candidate_hop
-                                extra_cost = item[1]
-                                break
-
-                    if decision.action == "hold" or chosen_hop is None:
-                        source_projected_pressure = node_projected_pressure.get(node_id, 0.0)
-                        should_force_forward = (
-                            source_projected_pressure >= self.WITH_C_FORCE_FORWARD_SOURCE_PRESSURE
-                            or held_from_node >= hold_cap
-                        )
-                        if should_force_forward:
-                            forced_hop = self._without_c_agent.next_hop(shipment.current_node, shipment.destination)
-                            if forced_hop is not None:
-                                hop = forced_hop
-                            else:
-                                queue.rotate(-1)
-                                held_from_node += 1
-                                continue
-                        else:
-                            queue.rotate(-1)
-                            held_from_node += 1
-                            continue
-                    else:
-                        hop = chosen_hop
-                        extra_cost = decision.expected_extra_cost
+                    if resolved["action"] == "hold":
+                        queue.rotate(-1)
+                        held_from_node += 1
+                        continue
+                    hop = resolved["hop"]
+                    extra_cost = float(resolved["expected_extra_cost"])
                 else:
+                    node_pressure, node_projected_pressure, node_flow_trend = self._pressure_maps()
+                    counterfactual_decision = self._resolve_with_c_decision(
+                        shipment=shipment,
+                        node_id=node_id,
+                        held_from_node=held_from_node,
+                        hold_cap=hold_cap,
+                        node_pressure=node_pressure,
+                        node_projected_pressure=node_projected_pressure,
+                        node_flow_trend=node_flow_trend,
+                    )
                     hop = self._without_c_agent.next_hop(shipment.current_node, shipment.destination)
                     if hop is not None and not self._node_can_accept(hop.target, shipment.load):
                         hop = self._find_feasible_without_c_hop(shipment.current_node, shipment.destination, shipment.load)
@@ -484,8 +466,19 @@ class SimulatorCore:
                     else:
                         queue.rotate(-1)
                         held_from_node += 1
+                        log_meta = self._build_counterfactual_log_metadata(
+                            shipment=shipment,
+                            actual_action="queue",
+                            actual_hop=None,
+                            counterfactual_decision=counterfactual_decision,
+                            node_pressure=node_pressure,
+                            node_projected_pressure=node_projected_pressure,
+                            node_flow_trend=node_flow_trend,
+                            aggregate_count=1,
+                        ) if self._agent_mode == "without_c" else None
                         self._push_log(
-                            f"route unavailable for {shipment.id} at {self._node_name.get(node_id, node_id)}; keeping shipment queued"
+                            f"route unavailable for {shipment.id} at {self._node_name.get(node_id, node_id)}; keeping shipment queued",
+                            **(log_meta or {}),
                         )
                     continue
 
@@ -503,8 +496,19 @@ class SimulatorCore:
                         held_from_node += 1
                         continue
                     if moved_from_node == 0:
+                        log_meta = self._build_counterfactual_log_metadata(
+                            shipment=shipment,
+                            actual_action="queue",
+                            actual_hop=hop,
+                            counterfactual_decision=counterfactual_decision,
+                            node_pressure=node_pressure,
+                            node_projected_pressure=node_projected_pressure,
+                            node_flow_trend=node_flow_trend,
+                            aggregate_count=1,
+                        )
                         self._push_log(
-                            f"blocked at {self._node_name.get(node_id, node_id)}: next node {self._node_name.get(hop.target, hop.target)} is full"
+                            f"blocked at {self._node_name.get(node_id, node_id)}: next node {self._node_name.get(hop.target, hop.target)} is full",
+                            **(log_meta or {}),
                         )
                     break
 
@@ -524,6 +528,16 @@ class SimulatorCore:
                     )
                 )
                 lane_counters[(shipment.current_node, hop.target)] += 1
+                if self._agent_mode == "without_c":
+                    self._record_lane_counterfactual(
+                        lane_counterfactuals=lane_counterfactuals,
+                        shipment=shipment,
+                        actual_hop=hop,
+                        counterfactual_decision=counterfactual_decision,
+                        node_pressure=node_pressure,
+                        node_projected_pressure=node_projected_pressure,
+                        node_flow_trend=node_flow_trend,
+                    )
                 moved_count += 1
                 moved_load += shipment.load
                 if self._agent_mode == "with_c":
@@ -534,8 +548,15 @@ class SimulatorCore:
                 self._push_log(f"held {held_from_node} shipments at {self._node_name.get(node_id, node_id)} to avoid downstream pressure")
 
         for (source, target), count_value in lane_counters.items():
+            log_meta = None
+            if self._agent_mode == "without_c":
+                log_meta = self._lane_counterfactual_log_metadata(
+                    lane_counterfactuals.get((source, target)),
+                    aggregate_count=count_value,
+                )
             self._push_log(
-                f"moved {count_value} shipments from {self._node_name.get(source, source)} to {self._node_name.get(target, target)}"
+                f"moved {count_value} shipments from {self._node_name.get(source, source)} to {self._node_name.get(target, target)}",
+                **(log_meta or {}),
             )
 
         self._last_edge_move_counts = dict(edge_move_counts)
@@ -763,8 +784,288 @@ class SimulatorCore:
         )
         return current_load + (self.PENDING_FAILURE_WEIGHT * pending_load) + stalled_gate_load
 
-    def _push_log(self, message: str) -> None:
-        self._recent_logs.insert(0, SimulationLog(tick=self._tick, message=message))
+    def _resolve_with_c_decision(
+        self,
+        *,
+        shipment: SimShipment,
+        node_id: str,
+        held_from_node: int,
+        hold_cap: int,
+        node_pressure: dict[str, float],
+        node_projected_pressure: dict[str, float],
+        node_flow_trend: dict[str, float],
+    ) -> dict[str, object]:
+        decision = self._with_c_agent.decide(
+            source=shipment.current_node,
+            destination=shipment.destination,
+            priority=shipment.priority,
+            node_pressure=node_pressure,
+            node_projected_pressure=node_projected_pressure,
+            node_flow_trend=node_flow_trend,
+        )
+        chosen_hop: PlannedHop | None = decision.hop
+        expected_extra_cost = decision.expected_extra_cost
+        if chosen_hop is not None and not self._node_can_accept(chosen_hop.target, shipment.load):
+            ranked = self._with_c_agent.ranked_hops(
+                source=shipment.current_node,
+                destination=shipment.destination,
+                priority=shipment.priority,
+                node_pressure=node_pressure,
+                node_projected_pressure=node_projected_pressure,
+                node_flow_trend=node_flow_trend,
+            )
+            chosen_hop = None
+            expected_extra_cost = 0.0
+            for item in ranked:
+                candidate_hop = item[4]
+                if self._node_can_accept(candidate_hop.target, shipment.load):
+                    chosen_hop = candidate_hop
+                    expected_extra_cost = item[1]
+                    break
+
+        action = str(decision.action)
+        reason = str(decision.reason)
+        if decision.action == "hold" or chosen_hop is None:
+            source_projected_pressure = node_projected_pressure.get(node_id, 0.0)
+            should_force_forward = (
+                source_projected_pressure >= self.WITH_C_FORCE_FORWARD_SOURCE_PRESSURE
+                or held_from_node >= hold_cap
+            )
+            if should_force_forward:
+                forced_hop = self._without_c_agent.next_hop(shipment.current_node, shipment.destination)
+                if forced_hop is not None:
+                    action = "move"
+                    chosen_hop = forced_hop
+                    reason = "force-forward-source-pressure"
+                else:
+                    action = "hold"
+                    chosen_hop = None
+            else:
+                action = "hold"
+                chosen_hop = None
+
+        return {
+            "action": action,
+            "hop": chosen_hop,
+            "reason": reason,
+            "expected_extra_cost": round(max(0.0, float(expected_extra_cost)), 3),
+        }
+
+    def _record_lane_counterfactual(
+        self,
+        *,
+        lane_counterfactuals: dict[tuple[str, str], dict[str, object]],
+        shipment: SimShipment,
+        actual_hop: PlannedHop,
+        counterfactual_decision: dict[str, object] | None,
+        node_pressure: dict[str, float],
+        node_projected_pressure: dict[str, float],
+        node_flow_trend: dict[str, float],
+    ) -> None:
+        if counterfactual_decision is None:
+            return
+        cf_action = str(counterfactual_decision.get("action", "hold"))
+        cf_hop = counterfactual_decision.get("hop")
+        cf_target = cf_hop.target if isinstance(cf_hop, PlannedHop) else None
+        if cf_action == "move" and cf_target == actual_hop.target:
+            return
+
+        key = (shipment.current_node, actual_hop.target)
+        bucket = lane_counterfactuals.get(key)
+        if bucket is None:
+            bucket = {
+                "hold_count": 0,
+                "reroute_counts": defaultdict(int),
+                "sample_context": self._build_counterfactual_context(
+                    shipment=shipment,
+                    actual_action="move",
+                    actual_hop=actual_hop,
+                    counterfactual_decision=counterfactual_decision,
+                    node_pressure=node_pressure,
+                    node_projected_pressure=node_projected_pressure,
+                    node_flow_trend=node_flow_trend,
+                    aggregate_count=1,
+                ),
+            }
+            lane_counterfactuals[key] = bucket
+
+        if cf_action == "hold" or cf_target is None:
+            bucket["hold_count"] = int(bucket["hold_count"]) + 1
+        else:
+            reroute_counts = bucket["reroute_counts"]
+            assert isinstance(reroute_counts, defaultdict)
+            reroute_counts[cf_target] += 1
+
+    def _lane_counterfactual_log_metadata(self, bucket: dict[str, object] | None, *, aggregate_count: int) -> dict[str, object] | None:
+        if not bucket:
+            return None
+
+        hold_count = int(bucket.get("hold_count", 0))
+        reroute_counts = bucket.get("reroute_counts")
+        reroute_parts: list[str] = []
+        if isinstance(reroute_counts, defaultdict):
+            for target, count_value in sorted(reroute_counts.items(), key=lambda item: (-item[1], self._node_name.get(item[0], item[0]))):
+                reroute_parts.append(f"reroute {count_value} to {self._node_name.get(target, target)}")
+
+        parts: list[str] = []
+        if hold_count > 0:
+            parts.append(f"hold {hold_count}")
+        parts.extend(reroute_parts)
+        if not parts:
+            return None
+
+        sample_context = bucket.get("sample_context")
+        context = dict(sample_context) if isinstance(sample_context, dict) else None
+        if context is not None:
+            context["aggregate_count"] = aggregate_count
+            context["counterfactual_aggregate"] = {
+                "hold_count": hold_count,
+                "reroutes": [
+                    {
+                        "target_node": self._node_name.get(target, target),
+                        "count": count_value,
+                    }
+                    for target, count_value in (sorted(reroute_counts.items(), key=lambda item: (-item[1], self._node_name.get(item[0], item[0]))) if isinstance(reroute_counts, defaultdict) else [])
+                ],
+            }
+
+        return {
+            "counterfactual_diff": True,
+            "counterfactual_agent": "with_c",
+            "counterfactual_summary": f"WITH C would {' and '.join(parts)}",
+            "counterfactual_context": context,
+        }
+
+    def _build_counterfactual_log_metadata(
+        self,
+        *,
+        shipment: SimShipment,
+        actual_action: str,
+        actual_hop: PlannedHop | None,
+        counterfactual_decision: dict[str, object] | None,
+        node_pressure: dict[str, float],
+        node_projected_pressure: dict[str, float],
+        node_flow_trend: dict[str, float],
+        aggregate_count: int,
+    ) -> dict[str, object] | None:
+        if counterfactual_decision is None:
+            return None
+
+        cf_action = str(counterfactual_decision.get("action", "hold"))
+        cf_hop = counterfactual_decision.get("hop")
+        cf_target = cf_hop.target if isinstance(cf_hop, PlannedHop) else None
+        actual_target = actual_hop.target if actual_hop is not None else None
+        if actual_action == cf_action and actual_target == cf_target:
+            return None
+
+        summary = "WITH C would hold"
+        if cf_action == "move" and cf_target is not None:
+            summary = f"WITH C would reroute to {self._node_name.get(cf_target, cf_target)}"
+
+        return {
+            "counterfactual_diff": True,
+            "counterfactual_agent": "with_c",
+            "counterfactual_summary": summary,
+            "counterfactual_context": self._build_counterfactual_context(
+                shipment=shipment,
+                actual_action=actual_action,
+                actual_hop=actual_hop,
+                counterfactual_decision=counterfactual_decision,
+                node_pressure=node_pressure,
+                node_projected_pressure=node_projected_pressure,
+                node_flow_trend=node_flow_trend,
+                aggregate_count=aggregate_count,
+            ),
+        }
+
+    def _build_counterfactual_context(
+        self,
+        *,
+        shipment: SimShipment,
+        actual_action: str,
+        actual_hop: PlannedHop | None,
+        counterfactual_decision: dict[str, object],
+        node_pressure: dict[str, float],
+        node_projected_pressure: dict[str, float],
+        node_flow_trend: dict[str, float],
+        aggregate_count: int,
+    ) -> dict[str, object]:
+        cf_hop = counterfactual_decision.get("hop")
+        cf_target = cf_hop.target if isinstance(cf_hop, PlannedHop) else None
+        relevant_nodes = {shipment.current_node, shipment.destination}
+        if actual_hop is not None:
+            relevant_nodes.add(actual_hop.target)
+        if cf_target is not None:
+            relevant_nodes.add(cf_target)
+
+        node_stats = self._build_node_stats()
+        relevant_snapshot = {}
+        for node_id in relevant_nodes:
+            if node_id not in node_stats:
+                continue
+            relevant_snapshot[node_id] = {
+                "name": self._node_name.get(node_id, node_id),
+                "node_stats": node_stats[node_id].model_dump(),
+                "pressure": round(node_pressure.get(node_id, 0.0), 3),
+                "projected_pressure": round(node_projected_pressure.get(node_id, 0.0), 3),
+                "flow_trend": round(node_flow_trend.get(node_id, 0.0), 3),
+            }
+
+        return {
+            "tick": self._tick,
+            "active_agent": self._agent_mode,
+            "shipment": {
+                "id": shipment.id,
+                "source_node": self._node_name.get(shipment.current_node, shipment.current_node),
+                "destination_node": self._node_name.get(shipment.destination, shipment.destination),
+                "load": shipment.load,
+                "priority": shipment.priority.value,
+                "deadline_tick": shipment.deadline_tick,
+            },
+            "aggregate_count": aggregate_count,
+            "actual_decision": {
+                "action": actual_action,
+                "target_node": self._node_name.get(actual_hop.target, actual_hop.target) if actual_hop is not None else None,
+            },
+            "with_c_decision": {
+                "action": str(counterfactual_decision.get("action", "hold")),
+                "target_node": self._node_name.get(cf_target, cf_target) if cf_target is not None else None,
+                "reason": str(counterfactual_decision.get("reason", "")),
+                "expected_extra_cost": float(counterfactual_decision.get("expected_extra_cost", 0.0)),
+            },
+            "simulation_summary": {
+                "queued_shipments": sum(len(q) for q in self._queues.values()),
+                "in_transit_shipments": len(self._in_transit),
+                "holding_shipments": len(self._holding),
+                "consumed_shipments": self._consumed_shipments,
+                "full_nodes": self._count_full_nodes(),
+                "failed": self._failed,
+                "failure_reason": self._failure_reason,
+            },
+            "relevant_nodes": relevant_snapshot,
+        }
+
+    def _push_log(
+        self,
+        message: str,
+        *,
+        counterfactual_diff: bool = False,
+        counterfactual_agent: str | None = None,
+        counterfactual_summary: str | None = None,
+        counterfactual_context: dict[str, object] | None = None,
+    ) -> None:
+        self._recent_logs.insert(
+            0,
+            SimulationLog(
+                log_id=next(self._log_seq),
+                tick=self._tick,
+                message=message,
+                counterfactual_diff=counterfactual_diff,
+                counterfactual_agent=counterfactual_agent,
+                counterfactual_summary=counterfactual_summary,
+                counterfactual_context=counterfactual_context,
+            ),
+        )
         if len(self._recent_logs) > 250:
             self._recent_logs = self._recent_logs[:250]
 

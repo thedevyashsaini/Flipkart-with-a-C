@@ -435,6 +435,9 @@ export default function Page() {
   const agentDragStartOffsetRef = useRef(0)
   const [agentDragOffset, setAgentDragOffset] = useState<number | null>(null)
   const [kpiChartUrl, setKpiChartUrl] = useState<string>("")
+  const [hoveredCounterfactualLogId, setHoveredCounterfactualLogId] = useState<number | null>(null)
+  const [activeCounterfactualLogId, setActiveCounterfactualLogId] = useState<number | null>(null)
+  const [logExplanations, setLogExplanations] = useState<Record<number, { status: "loading" | "done" | "error"; text: string }>>({})
 
   const selectedNodeDetails = useMemo(
     () => toSelectedNodeDetails(world, simState, selectedNodeId),
@@ -669,6 +672,9 @@ export default function Page() {
           URL.revokeObjectURL(kpiChartUrl)
         }
         setKpiChartUrl("")
+        setHoveredCounterfactualLogId(null)
+        setActiveCounterfactualLogId(null)
+        setLogExplanations({})
       } else if (action === "start") {
         setSimStreamError("")
         setDemandStreamError("")
@@ -676,6 +682,9 @@ export default function Page() {
           URL.revokeObjectURL(kpiChartUrl)
         }
         setKpiChartUrl("")
+        setHoveredCounterfactualLogId(null)
+        setActiveCounterfactualLogId(null)
+        setLogExplanations({})
       }
     } catch (err) {
       const msg = (err as Error).message
@@ -715,6 +724,39 @@ export default function Page() {
       setDemandStreamError(msg)
     } finally {
       setInjectingNodeId(null)
+    }
+  }
+
+  async function explainLog(logId: number) {
+    setActiveCounterfactualLogId(logId)
+    if (logExplanations[logId]?.status === "done") {
+      return
+    }
+
+    setLogExplanations(prev => ({
+      ...prev,
+      [logId]: { status: "loading", text: "Explaining..." },
+    }))
+
+    try {
+      const response = await fetch(`${API_BASE}/sim/explain-log`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ log_id: logId }),
+      })
+      const payload = await response.json() as { explanation?: string; detail?: string }
+      if (!response.ok || !payload.explanation) {
+        throw new Error(payload.detail || `explain failed (${response.status})`)
+      }
+      setLogExplanations(prev => ({
+        ...prev,
+        [logId]: { status: "done", text: payload.explanation ?? "" },
+      }))
+    } catch (err) {
+      setLogExplanations(prev => ({
+        ...prev,
+        [logId]: { status: "error", text: (err as Error).message },
+      }))
     }
   }
 
@@ -1166,9 +1208,58 @@ export default function Page() {
                 ) : null}
                 <div className="mt-2 space-y-1.5">
                   {(simState?.recent_logs ?? []).slice(0, 50).map((log, index) => (
-                    <div key={`${log.tick}-${index}`} className="rounded-none border border-border/60 bg-background/30 px-2 py-1 text-[10px] leading-4 text-foreground/95">
-                      <span className="mr-2 text-[10px] text-muted-foreground">T+{log.tick}</span>
-                      {log.message}
+                    <div key={`${log.log_id}-${index}`} className="relative rounded-none border border-border/60 bg-background/30 px-2 py-1 text-[10px] leading-4 text-foreground/95">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <span className="mr-2 text-[10px] text-muted-foreground">T+{log.tick}</span>
+                          {log.message}
+                        </div>
+                        {simState?.agent_mode === "without_c" && log.counterfactual_diff && log.counterfactual_summary ? (
+                          <button
+                            type="button"
+                            className="relative mt-0.5 h-4 w-4 shrink-0 rounded-full border border-sky-300/40 bg-sky-400/12 text-[10px] font-semibold text-sky-200 hover:bg-sky-400/18"
+                            onMouseEnter={() => setHoveredCounterfactualLogId(log.log_id)}
+                            onMouseLeave={() => setHoveredCounterfactualLogId(current => current === log.log_id && activeCounterfactualLogId !== log.log_id ? null : current)}
+                            onClick={() => {
+                              if (activeCounterfactualLogId === log.log_id) {
+                                setActiveCounterfactualLogId(null)
+                                return
+                              }
+                              void explainLog(log.log_id)
+                            }}
+                            title="Show with-c counterfactual"
+                          >
+                            i
+                          </button>
+                        ) : null}
+                      </div>
+                      {simState?.agent_mode === "without_c" && log.counterfactual_diff && log.counterfactual_summary && (hoveredCounterfactualLogId === log.log_id || activeCounterfactualLogId === log.log_id) ? (
+                        <div
+                          className="absolute right-1 top-[calc(100%+4px)] z-20 w-72 rounded-none border border-sky-300/30 bg-card/95 p-2 text-[10px] shadow-[0_10px_24px_rgba(0,0,0,0.38)]"
+                          onMouseEnter={() => setHoveredCounterfactualLogId(log.log_id)}
+                          onMouseLeave={() => {
+                            setHoveredCounterfactualLogId(null)
+                            if (activeCounterfactualLogId !== log.log_id) {
+                              setHoveredCounterfactualLogId(null)
+                            }
+                          }}
+                        >
+                          <div className="font-semibold tracking-[0.08em] text-sky-200">WITH C COUNTERFACTUAL</div>
+                          <div className="mt-1 text-foreground/95">{log.counterfactual_summary}</div>
+                          <button
+                            type="button"
+                            className="mt-2 rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-medium text-foreground hover:bg-foreground/10"
+                            onClick={() => void explainLog(log.log_id)}
+                          >
+                            {logExplanations[log.log_id]?.status === "loading" ? "Explaining..." : "Explain With Gemini"}
+                          </button>
+                          {logExplanations[log.log_id] ? (
+                            <div className={`mt-2 whitespace-pre-wrap rounded-none border px-2 py-2 text-[10px] leading-4 ${logExplanations[log.log_id]?.status === "error" ? "border-amber-400/30 bg-amber-400/10 text-amber-200" : "border-border/60 bg-background/30 text-foreground/95"}`}>
+                              {logExplanations[log.log_id]?.text}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
                     </div>
                   ))}
                   {(simState?.recent_logs ?? []).length === 0 ? (

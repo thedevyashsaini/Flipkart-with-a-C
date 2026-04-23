@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
 class SimulationLog(BaseModel):
+    log_id: int = Field(ge=1)
     tick: int = Field(ge=0)
     message: str
+    counterfactual_diff: bool = False
+    counterfactual_agent: str | None = None
+    counterfactual_summary: str | None = None
+    counterfactual_context: dict[str, Any] | None = None
 
 
 class NodeSimulationStat(BaseModel):

@@ -3,7 +3,11 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import random
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,8 +32,28 @@ app.add_middleware(
 )
 
 WORLD_PATH = Path(__file__).parent / "data" / "world.json"
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 demand_generator: DemandGenerator | None = None
 simulator_core: SimulatorCore | None = None
+explanation_cache: dict[int, str] = {}
+
+
+def load_env_file() -> None:
+    if not ENV_PATH.exists():
+        return
+
+    for raw_line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+load_env_file()
 
 
 class StressEventTemplate(BaseModel):
@@ -119,6 +143,10 @@ class SimulationClearResponse(BaseModel):
 
 class StressProfilesResponse(BaseModel):
     profiles: list[StressProfile]
+
+
+class ExplainLogRequest(BaseModel):
+    log_id: int = Field(ge=1)
 
 
 def load_world() -> World:
@@ -252,6 +280,7 @@ async def simulation_stream(request: Request) -> StreamingResponse:
 
 @app.post("/sim/start")
 def simulation_start(payload: SimulationStartRequest | None = None) -> dict[str, bool]:
+    explanation_cache.clear()
     seed = payload.seed if payload is not None else (demand_generator.get_state().seed if demand_generator is not None else 42)
     tick = payload.tick if payload is not None else 0
     agent_mode = payload.agent_mode if payload is not None else (simulator_core.get_state().agent_mode if simulator_core is not None else "without_c")
@@ -321,6 +350,7 @@ def simulation_set_agent_mode(payload: SimulationAgentModeRequest) -> dict[str, 
 @app.post("/sim/clear")
 def simulation_clear() -> SimulationClearResponse:
     next_seed = random.randint(1, 999_999_999)
+    explanation_cache.clear()
     if demand_generator is not None:
         demand_generator.configure(seed=next_seed, start_tick=0)
     if simulator_core is not None:
@@ -384,6 +414,126 @@ def simulation_kpi_chart() -> StreamingResponse:
     FigureCanvas(fig).print_png(image_bytes)
     image_bytes.seek(0)
     return StreamingResponse(image_bytes, media_type="image/png")
+
+
+@app.post("/sim/explain-log")
+def simulation_explain_log(payload: ExplainLogRequest) -> dict[str, str | int | bool]:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite").strip() or "gemini-2.0-flash-lite"
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
+    if simulator_core is None:
+        raise HTTPException(status_code=503, detail="Simulator unavailable")
+
+    if payload.log_id in explanation_cache:
+        return {"ok": True, "log_id": payload.log_id, "explanation": explanation_cache[payload.log_id], "cached": True}
+
+    log = next((item for item in simulator_core.get_state().recent_logs if item.log_id == payload.log_id), None)
+    if log is None:
+        raise HTTPException(status_code=404, detail="Log not found")
+    if not log.counterfactual_diff or not log.counterfactual_context:
+        raise HTTPException(status_code=400, detail="Log does not have counterfactual context")
+
+    current_state = simulator_core.get_state()
+    world = load_world()
+    full_graph_state = {
+        "world": world.model_dump(),
+        "simulation_state": current_state.model_dump(),
+    }
+
+    prompt = (
+        "You are explaining why the WITH C agent made the safer system-stability choice in a supply-chain simulation. "
+        "The WITHOUT C agent is the actual baseline. WITH C is the preferred controller. "
+        "Explain why WITH C's counterfactual decision is better for this exact state. "
+        "Be concrete about pressure, backlog, downstream risk, and cascading failure. "
+        "Use 3 short bullet points. Mention node names when useful. Avoid hype. Return plain text only. Do not return JSON. Do not include chain-of-thought.\n\n"
+        f"Visible log message: {log.message}\n"
+        f"Counterfactual summary: {log.counterfactual_summary}\n\n"
+        "Structured decision context for this divergent log:\n"
+        f"{json.dumps(log.counterfactual_context, separators=(',', ':'))}\n\n"
+        "Full current graph state and simulator state:\n"
+        f"{json.dumps(full_graph_state, separators=(',', ':'))}"
+    )
+
+    request_body = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt,
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "text/plain",
+        },
+        "thinkingConfig": {
+            "thinkingBudget": 0,
+        },
+    }
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent?key={urllib.parse.quote(api_key, safe='')}"
+    try:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(request_body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf-8", errors="replace")
+        if err.code == 400 and "thinkingConfig" in detail:
+            fallback_body = dict(request_body)
+            fallback_body.pop("thinkingConfig", None)
+            fallback_request = urllib.request.Request(
+                url,
+                data=json.dumps(fallback_body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(fallback_request, timeout=20) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as fallback_err:
+                fallback_detail = fallback_err.read().decode("utf-8", errors="replace")
+                raise HTTPException(status_code=502, detail=f"Gemini request failed: {fallback_detail}") from fallback_err
+            except urllib.error.URLError as fallback_err:
+                raise HTTPException(status_code=502, detail=f"Gemini request failed: {fallback_err.reason}") from fallback_err
+        else:
+            raise HTTPException(status_code=502, detail=f"Gemini request failed: {detail}") from err
+    except urllib.error.URLError as err:
+        raise HTTPException(status_code=502, detail=f"Gemini request failed: {err.reason}") from err
+
+    explanation = ""
+    for candidate in data.get("candidates", []):
+        content = candidate.get("content", {})
+        for part in content.get("parts", []):
+            if part.get("thought") or part.get("thoughtSignature"):
+                continue
+            text = part.get("text", "")
+            if text:
+                explanation = text.strip()
+                break
+        if explanation:
+            break
+
+    if not explanation:
+        for candidate in data.get("candidates", []):
+            content = candidate.get("content", {})
+            merged = "\n".join(part.get("text", "").strip() for part in content.get("parts", []) if part.get("text"))
+            if merged:
+                explanation = merged
+                break
+
+    if not explanation:
+        raise HTTPException(status_code=502, detail="Gemini returned no explanation text")
+
+    explanation_cache[payload.log_id] = explanation
+    return {"ok": True, "log_id": payload.log_id, "explanation": explanation, "cached": False}
 
 
 @app.post("/demand/inject/{node_id}")
