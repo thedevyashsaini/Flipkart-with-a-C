@@ -15,7 +15,8 @@ class DemandGenerator:
         self._tick_interval_sec = tick_interval_sec
         self._window_size = window_size
         self._seed = seed
-        self._rng = random.Random(seed)
+        self._rng_core = random.Random(seed)
+        self._rng_inject = random.Random(seed ^ 0x9E3779B9)
         self._shipment_seq = count(1)
         self._state_lock = threading.Lock()
         self._running = False
@@ -86,7 +87,8 @@ class DemandGenerator:
 
         with self._state_lock:
             self._seed = seed
-            self._rng = random.Random(seed)
+            self._rng_core = random.Random(seed)
+            self._rng_inject = random.Random(seed ^ 0x9E3779B9)
             self._running = False
             self._shipments = []
             self._new_shipments_buffer = []
@@ -118,18 +120,20 @@ class DemandGenerator:
             if destination_node is None:
                 return 0
 
+            rng = self._rng_inject
+
             generated: list[ShipmentDemand] = []
             candidate_sources = [node.id for node in self._nodes if node.id != destination]
             if not candidate_sources:
                 return 0
 
             for _ in range(shipment_count):
-                source = self._rng.choice(candidate_sources)
+                source = rng.choice(candidate_sources)
                 source_region = self._node_region[source]
                 destination_region = destination_node.region
-                load = round(self._rng.uniform(1.2, 3.8), 2)
+                load = round(rng.uniform(1.2, 3.8), 2)
                 base_deadline = 7 if source_region == destination_region else 14
-                jitter = self._rng.randint(0, 10)
+                jitter = rng.randint(0, 10)
                 generated.append(
                     ShipmentDemand(
                         id=f"sh{next(self._shipment_seq):06d}",
@@ -138,9 +142,9 @@ class DemandGenerator:
                         source_region=source_region,
                         destination_region=destination_region,
                         load=load,
-                        priority=ShipmentPriority.HIGH if self._rng.random() < 0.7 else ShipmentPriority.CRITICAL,
+                        priority=ShipmentPriority.HIGH if rng.random() < 0.7 else ShipmentPriority.CRITICAL,
                         deadline_tick=self._tick + base_deadline + jitter,
-                        sku_class=self._sample_sku(),
+                        sku_class=self._sample_sku(rng),
                         created_tick=self._tick,
                     )
                 )
@@ -183,13 +187,14 @@ class DemandGenerator:
             self._latest_state = self._build_state()
 
     def _generate_tick_shipments(self, tick: int) -> list[ShipmentDemand]:
+        rng = self._rng_core
         low = 10
         high = 24
         if tick % 15 == 0:
             low = 26
             high = 46
 
-        count_this_tick = self._rng.randint(low, high)
+        count_this_tick = rng.randint(low, high)
         generated: list[ShipmentDemand] = []
 
         regions = list(self._by_region.keys())
@@ -202,33 +207,33 @@ class DemandGenerator:
                 ("ME", "EU"),
                 ("IN-EAST", "IN-SOUTH"),
             ]
-            hotspot_lane = self._rng.choice(hotspots)
+            hotspot_lane = rng.choice(hotspots)
 
         for _ in range(count_this_tick):
-            source_region = self._weighted_choice(self._source_region_weights)
-            cross_region = self._rng.random() < self._cross_region_bias.get(source_region, 0.5)
+            source_region = self._weighted_choice(self._source_region_weights, rng)
+            cross_region = rng.random() < self._cross_region_bias.get(source_region, 0.5)
 
-            if hotspot_lane and self._rng.random() < 0.26:
+            if hotspot_lane and rng.random() < 0.26:
                 source_region, destination_region = hotspot_lane
             elif cross_region:
-                destination_region = self._sample_cross_destination(source_region, regions)
+                destination_region = self._sample_cross_destination(source_region, regions, rng)
             else:
                 destination_region = source_region
 
             if source_region not in self._by_region or destination_region not in self._by_region:
                 continue
 
-            source = self._rng.choice(self._by_region[source_region])
+            source = rng.choice(self._by_region[source_region])
             destination_candidates = [n for n in self._by_region[destination_region] if n != source]
             if not destination_candidates:
                 continue
-            destination = self._rng.choice(destination_candidates)
+            destination = rng.choice(destination_candidates)
 
-            priority = self._sample_priority()
-            sku_class = self._sample_sku()
-            load = round(self._rng.uniform(0.4, 3.2), 2)
+            priority = self._sample_priority(rng)
+            sku_class = self._sample_sku(rng)
+            load = round(rng.uniform(0.4, 3.2), 2)
             base_deadline = 6 if source_region == destination_region else 12
-            jitter = self._rng.randint(0, 12)
+            jitter = rng.randint(0, 12)
 
             shipment = ShipmentDemand(
                 id=f"sh{next(self._shipment_seq):06d}",
@@ -246,10 +251,10 @@ class DemandGenerator:
 
         return generated
 
-    def _weighted_choice(self, weights: dict[str, float]) -> str:
+    def _weighted_choice(self, weights: dict[str, float], rng: random.Random) -> str:
         items = [(key, value) for key, value in weights.items() if value > 0 and key in self._by_region]
         total = sum(value for _, value in items)
-        pick = self._rng.random() * total
+        pick = rng.random() * total
         cursor = 0.0
         for key, value in items:
             cursor += value
@@ -257,14 +262,14 @@ class DemandGenerator:
                 return key
         return items[-1][0]
 
-    def _sample_cross_destination(self, source_region: str, regions: list[str]) -> str:
+    def _sample_cross_destination(self, source_region: str, regions: list[str], rng: random.Random) -> str:
         candidates = [r for r in regions if r != source_region]
         preferred = self._lane_preferences.get(source_region, {})
         weighted = {region: preferred.get(region, 1.0) for region in candidates}
-        return self._weighted_choice(weighted)
+        return self._weighted_choice(weighted, rng)
 
-    def _sample_priority(self) -> ShipmentPriority:
-        p = self._rng.random()
+    def _sample_priority(self, rng: random.Random) -> ShipmentPriority:
+        p = rng.random()
         if p < 0.52:
             return ShipmentPriority.LOW
         if p < 0.82:
@@ -273,8 +278,8 @@ class DemandGenerator:
             return ShipmentPriority.HIGH
         return ShipmentPriority.CRITICAL
 
-    def _sample_sku(self) -> SKUClass:
-        p = self._rng.random()
+    def _sample_sku(self, rng: random.Random) -> SKUClass:
+        p = rng.random()
         if p < 0.55:
             return SKUClass.STANDARD
         if p < 0.75:

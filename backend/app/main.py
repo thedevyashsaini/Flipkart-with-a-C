@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import random
 from pathlib import Path
@@ -8,6 +9,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from matplotlib.figure import Figure
 from pydantic import BaseModel, Field
 
 from app.demand_generator import DemandGenerator
@@ -29,10 +32,69 @@ demand_generator: DemandGenerator | None = None
 simulator_core: SimulatorCore | None = None
 
 
+class StressEventTemplate(BaseModel):
+    tick: int = Field(ge=1)
+    slot_index: int = Field(ge=0)
+    shipment_count: int = Field(ge=1)
+
+
+class StressProfile(BaseModel):
+    id: str
+    label: str
+    required_nodes: int = Field(ge=1)
+    events: list[StressEventTemplate]
+
+
+STRESS_PROFILES: dict[str, StressProfile] = {
+    "profile_3": StressProfile(
+        id="profile_3",
+        label="Profile 3 - tri-node wave",
+        required_nodes=3,
+        events=[
+            StressEventTemplate(tick=20, slot_index=0, shipment_count=12),
+            StressEventTemplate(tick=24, slot_index=1, shipment_count=10),
+            StressEventTemplate(tick=28, slot_index=2, shipment_count=10),
+            StressEventTemplate(tick=34, slot_index=0, shipment_count=8),
+            StressEventTemplate(tick=38, slot_index=2, shipment_count=8),
+        ],
+    ),
+    "profile_4": StressProfile(
+        id="profile_4",
+        label="Profile 4 - regional cascade",
+        required_nodes=4,
+        events=[
+            StressEventTemplate(tick=18, slot_index=0, shipment_count=12),
+            StressEventTemplate(tick=22, slot_index=1, shipment_count=11),
+            StressEventTemplate(tick=26, slot_index=2, shipment_count=11),
+            StressEventTemplate(tick=30, slot_index=3, shipment_count=10),
+            StressEventTemplate(tick=38, slot_index=0, shipment_count=9),
+            StressEventTemplate(tick=42, slot_index=2, shipment_count=9),
+        ],
+    ),
+    "profile_5": StressProfile(
+        id="profile_5",
+        label="Profile 5 - distributed heavy",
+        required_nodes=5,
+        events=[
+            StressEventTemplate(tick=15, slot_index=0, shipment_count=12),
+            StressEventTemplate(tick=19, slot_index=1, shipment_count=12),
+            StressEventTemplate(tick=23, slot_index=2, shipment_count=11),
+            StressEventTemplate(tick=27, slot_index=3, shipment_count=11),
+            StressEventTemplate(tick=31, slot_index=4, shipment_count=10),
+            StressEventTemplate(tick=40, slot_index=1, shipment_count=9),
+            StressEventTemplate(tick=45, slot_index=3, shipment_count=9),
+            StressEventTemplate(tick=50, slot_index=0, shipment_count=8),
+        ],
+    ),
+}
+
+
 class SimulationStartRequest(BaseModel):
     seed: int = Field(ge=0)
     tick: int = Field(ge=0, default=0)
     agent_mode: str = Field(default="without_c")
+    stress_profile_id: str | None = None
+    stress_node_ids: list[str] = Field(default_factory=list)
 
 
 class SimulationAgentModeRequest(BaseModel):
@@ -43,6 +105,10 @@ class SimulationClearResponse(BaseModel):
     ok: bool
     seed: int = Field(ge=0)
     tick: int = Field(ge=0)
+
+
+class StressProfilesResponse(BaseModel):
+    profiles: list[StressProfile]
 
 
 def load_world() -> World:
@@ -67,6 +133,11 @@ def root():
 @app.get("/world", response_model=World)
 def world() -> World:
     return load_world()
+
+
+@app.get("/stress/profiles", response_model=StressProfilesResponse)
+def stress_profiles() -> StressProfilesResponse:
+    return StressProfilesResponse(profiles=list(STRESS_PROFILES.values()))
 
 
 @app.get("/demand/state", response_model=DemandState)
@@ -174,12 +245,44 @@ def simulation_start(payload: SimulationStartRequest | None = None) -> dict[str,
     seed = payload.seed if payload is not None else (demand_generator.get_state().seed if demand_generator is not None else 42)
     tick = payload.tick if payload is not None else 0
     agent_mode = payload.agent_mode if payload is not None else (simulator_core.get_state().agent_mode if simulator_core is not None else "without_c")
+    stress_profile_id = payload.stress_profile_id if payload is not None else None
+    stress_node_ids = payload.stress_node_ids if payload is not None else []
+
+    stress_plan: list[tuple[int, str, int]] = []
+    if stress_profile_id:
+        profile = STRESS_PROFILES.get(stress_profile_id)
+        if profile is None:
+            raise HTTPException(status_code=400, detail=f"Unknown stress profile: {stress_profile_id}")
+
+        unique_node_ids = []
+        seen_ids: set[str] = set()
+        world_data = simulator_core._world if simulator_core is not None else load_world()
+        valid_node_ids = {node.id for node in world_data.nodes}
+        for node_id in stress_node_ids:
+            if node_id in seen_ids:
+                continue
+            if node_id not in valid_node_ids:
+                raise HTTPException(status_code=400, detail=f"Unknown stress node id: {node_id}")
+            seen_ids.add(node_id)
+            unique_node_ids.append(node_id)
+
+        if len(unique_node_ids) != profile.required_nodes:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Profile {profile.id} requires exactly {profile.required_nodes} selected nodes",
+            )
+
+        for event in profile.events:
+            if event.slot_index >= len(unique_node_ids):
+                raise HTTPException(status_code=400, detail="Stress profile slot index out of selected node range")
+            stress_plan.append((event.tick, unique_node_ids[event.slot_index], event.shipment_count))
 
     if simulator_core is not None:
         simulator_core.set_agent_mode(agent_mode)
     if demand_generator is not None:
         demand_generator.configure(seed=seed, start_tick=0)
     if simulator_core is not None:
+        simulator_core.set_stress_plan(stress_plan)
         simulator_core.configure(start_tick=tick)
     if demand_generator is not None:
         demand_generator.set_running(True)
@@ -213,6 +316,64 @@ def simulation_clear() -> SimulationClearResponse:
     if simulator_core is not None:
         simulator_core.clear()
     return SimulationClearResponse(ok=True, seed=next_seed, tick=0)
+
+
+@app.get("/sim/kpi-chart")
+def simulation_kpi_chart() -> StreamingResponse:
+    if simulator_core is None:
+        raise HTTPException(status_code=503, detail="Simulator unavailable")
+
+    points = simulator_core.get_kpi_history()
+    if len(points) < 2:
+        raise HTTPException(status_code=400, detail="Not enough KPI history")
+
+    min_tick = int(points[0].get("tick", 0))
+    max_tick = int(points[-1].get("tick", min_tick))
+    ticks = [int(point.get("tick", 0)) for point in points]
+    delivered = [float(point.get("delivered_pct", 0.0)) for point in points]
+    backlog = [float(point.get("backlog_pct", 0.0)) for point in points]
+    full_nodes = [float(point.get("full_node_pct", 0.0)) for point in points]
+    avg_util = [float(point.get("avg_node_util_pct", 0.0)) for point in points]
+
+    fig = Figure(figsize=(10.8, 4.9), dpi=180, facecolor="#0d0e0c")
+    ax = fig.add_subplot(111)
+    ax.set_facecolor("#0d0e0c")
+
+    ax.plot(ticks, delivered, color="#22d3ee", linewidth=2.8, solid_capstyle="round", label="Delivered %")
+    ax.plot(ticks, backlog, color="#f59e0b", linewidth=2.8, solid_capstyle="round", label="Backlog %")
+    ax.plot(ticks, full_nodes, color="#f87171", linewidth=2.8, solid_capstyle="round", label="Full Nodes %")
+    ax.plot(ticks, avg_util, color="#34d399", linewidth=2.8, solid_capstyle="round", label="Avg Node Util %")
+
+    ax.set_xlim(min_tick, max_tick if max_tick > min_tick else min_tick + 1)
+    ax.set_ylim(0, 100)
+    ax.set_yticks([0, 25, 50, 75, 100])
+    ax.set_yticklabels(["0%", "25%", "50%", "75%", "100%"], color="#e0e2df")
+    ax.set_xticks([min_tick, max_tick])
+    ax.set_xticklabels([f"T+{min_tick}", f"T+{max_tick}"], color="#e0e2df")
+
+    ax.tick_params(colors="#d2d4d1", labelsize=10)
+    ax.grid(True, color="#4a4c47", alpha=0.55, linewidth=0.85)
+    for spine in ax.spines.values():
+        spine.set_color("#9a9c99")
+        spine.set_linewidth(1.0)
+
+    ax.set_title("KPI vs Time", color="#e7e9e6", fontsize=13, pad=14)
+    legend = ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=4,
+        frameon=False,
+        fontsize=10,
+        handlelength=2.6,
+    )
+    for text in legend.get_texts():
+        text.set_color("#d8dad7")
+
+    fig.tight_layout(pad=1.0)
+    image_bytes = io.BytesIO()
+    FigureCanvas(fig).print_png(image_bytes)
+    image_bytes.seek(0)
+    return StreamingResponse(image_bytes, media_type="image/png")
 
 
 @app.post("/demand/inject/{node_id}")

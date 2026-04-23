@@ -39,6 +39,8 @@ type NodeData = {
   consumedShipmentsTick: number
   activeLoadTons: number
   isFailed: boolean
+  isStressSelected: boolean
+  isStressSelectable: boolean
   onOpenDetails?: (node: {
     id: string
     code: string
@@ -53,6 +55,23 @@ type NodeData = {
     capacity: number
     avgHoldTicksPerTon: number
   }) => void
+}
+
+type StressEventTemplate = {
+  tick: number
+  slot_index: number
+  shipment_count: number
+}
+
+type StressProfile = {
+  id: string
+  label: string
+  required_nodes: number
+  events: StressEventTemplate[]
+}
+
+type StressProfilesResponse = {
+  profiles: StressProfile[]
 }
 
 const TYPE_STYLE: Record<NodeData["type"], string> = {
@@ -78,7 +97,7 @@ function WorldNode({ data }: NodeProps<Node<NodeData>>) {
 
   return (
     <div
-      className={`relative min-w-24 rounded-xl border px-3 py-2 text-center transition-[opacity,box-shadow,filter,border-color] duration-150 ${TYPE_STYLE[data.type]} ${emphasisClass}`}
+      className={`relative min-w-24 rounded-xl border px-3 py-2 text-center transition-[opacity,box-shadow,filter,border-color] duration-150 ${TYPE_STYLE[data.type]} ${emphasisClass} ${data.isStressSelected ? "ring-2 ring-rose-400/80" : ""}`}
       style={{
         boxShadow: heatShadow,
         filter: `saturate(${1 + heat * 0.35}) brightness(${1 + heat * 0.2})`,
@@ -114,6 +133,7 @@ function WorldNode({ data }: NodeProps<Node<NodeData>>) {
 
       <div className="text-[12px] font-semibold tracking-wide">{data.code}</div>
       <div className="text-[10px] opacity-70">{data.type}</div>
+      {data.isStressSelected ? <div className="absolute -right-1 -top-1 rounded-none border border-rose-300/70 bg-rose-400/20 px-1 text-[9px] font-semibold text-rose-100">S</div> : null}
       {pulse ? <div className={`absolute -inset-1 rounded-xl border animate-pulse ${data.isFailed ? "border-rose-400/60" : "border-amber-300/40"}`} /> : null}
     </div>
   )
@@ -277,6 +297,8 @@ function buildWorldGraph(
   world: World,
   highlightedRegion: string | null,
   simState: SimulationState | null,
+  stressSelectedNodeIds: Set<string>,
+  stressSelectionActive: boolean,
   onOpenDetails?: NodeData["onOpenDetails"],
 ): { nodes: Node<NodeData>[]; edges: Edge[] } {
   const codeById = new Map<string, string>()
@@ -328,6 +350,8 @@ function buildWorldGraph(
       consumedShipmentsTick: simState?.node_stats?.[node.id]?.consumed_shipments_tick ?? 0,
       activeLoadTons: simState?.node_stats?.[node.id]?.active_load_tons ?? 0,
       isFailed: Boolean(simState?.failed && simState?.failed_node_names?.includes(node.name)),
+      isStressSelected: stressSelectedNodeIds.has(node.id),
+      isStressSelectable: stressSelectionActive,
       onOpenDetails,
     },
   }))
@@ -395,6 +419,9 @@ export default function Page() {
   const [agentMode, setAgentMode] = useState<"without_c" | "with_c">("without_c")
   const [seedInput, setSeedInput] = useState("42")
   const [tickInput, setTickInput] = useState("0")
+  const [stressProfiles, setStressProfiles] = useState<StressProfile[]>([])
+  const [selectedStressProfileId, setSelectedStressProfileId] = useState<string>("none")
+  const [selectedStressNodeIds, setSelectedStressNodeIds] = useState<string[]>([])
   const [nodes, setNodes, onNodesChange] = useNodesState<Node<NodeData>>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
   const laneCountRef = useRef<Map<string, number>>(new Map())
@@ -407,11 +434,19 @@ export default function Page() {
   const agentDragStartXRef = useRef(0)
   const agentDragStartOffsetRef = useRef(0)
   const [agentDragOffset, setAgentDragOffset] = useState<number | null>(null)
+  const [kpiChartUrl, setKpiChartUrl] = useState<string>("")
 
   const selectedNodeDetails = useMemo(
     () => toSelectedNodeDetails(world, simState, selectedNodeId),
     [world, simState, selectedNodeId],
   )
+  const selectedStressProfile = useMemo(
+    () => stressProfiles.find(profile => profile.id === selectedStressProfileId) ?? null,
+    [stressProfiles, selectedStressProfileId],
+  )
+  const stressSelectionActive = selectedStressProfile !== null
+  const selectedStressNodeSet = useMemo(() => new Set(selectedStressNodeIds), [selectedStressNodeIds])
+  const stressSelectionReady = selectedStressProfile === null || selectedStressNodeIds.length === selectedStressProfile.required_nodes
   const selectedEdgeDetails = useMemo(
     () => toSelectedEdgeDetails(world, simState, selectedEdgeCorridor),
     [world, simState, selectedEdgeCorridor],
@@ -425,6 +460,55 @@ export default function Page() {
       return node ? toCode(node.name, node.type) : name
     })
   }, [world, simState])
+  const kpiSnapshot = useMemo(() => {
+    const totalGenerated = demand?.total_generated ?? 0
+    const consumed = simState?.consumed_shipments ?? 0
+    const queued = simState?.queued_shipments ?? 0
+    const inTransit = simState?.in_transit_shipments ?? 0
+    const holding = simState?.holding_shipments ?? 0
+    const backlog = queued + inTransit + holding
+    const moved = simState?.moved_shipments_tick ?? 0
+    const movedLoad = simState?.moved_load_tick ?? 0
+    const blockedAdmission = simState?.blocked_admission_tick ?? 0
+    const fullNodes = simState?.full_nodes ?? 0
+    const nodeCount = world?.nodes.length ?? 0
+
+    const deliveredPct = totalGenerated > 0 ? (consumed / totalGenerated) * 100 : 0
+    const backlogPct = totalGenerated > 0 ? (backlog / totalGenerated) * 100 : 0
+    const fullNodePct = nodeCount > 0 ? (fullNodes / nodeCount) * 100 : 0
+
+    let avgNodeUtilPct = 0
+    if (simState?.node_stats && nodeCount > 0) {
+      const sumUtil = Object.values(simState.node_stats).reduce((acc, stat) => {
+        if (!stat || stat.capacity <= 0) {
+          return acc
+        }
+        return acc + (stat.active_load_tons / stat.capacity)
+      }, 0)
+      avgNodeUtilPct = (sumUtil / nodeCount) * 100
+    }
+
+    return {
+      totalGenerated,
+      consumed,
+      backlog,
+      deliveredPct,
+      backlogPct,
+      fullNodes,
+      fullNodePct,
+      avgNodeUtilPct,
+      moved,
+      movedLoad,
+      blockedAdmission,
+    }
+  }, [demand, simState, world])
+  useEffect(() => {
+    return () => {
+      if (kpiChartUrl) {
+        URL.revokeObjectURL(kpiChartUrl)
+      }
+    }
+  }, [kpiChartUrl])
 
   useEffect(() => {
     async function loadWorld() {
@@ -441,6 +525,23 @@ export default function Page() {
     }
 
     loadWorld()
+  }, [])
+
+  useEffect(() => {
+    async function loadStressProfiles() {
+      try {
+        const response = await fetch(`${API_BASE}/stress/profiles`, { cache: "no-store" })
+        if (!response.ok) {
+          throw new Error(`Failed to fetch stress profiles: ${response.status}`)
+        }
+        const data = (await response.json()) as StressProfilesResponse
+        setStressProfiles(data.profiles)
+      } catch (err) {
+        setError((err as Error).message)
+      }
+    }
+
+    loadStressProfiles()
   }, [])
 
   useEffect(() => {
@@ -533,13 +634,23 @@ export default function Page() {
       const requestInit: RequestInit = { method: "POST" }
 
       if (action === "start") {
+        if (!stressSelectionReady) {
+          setSimStreamError(`Select exactly ${selectedStressProfile?.required_nodes ?? 0} stress nodes before starting`)
+          return
+        }
         const normalizedSeed = parseNonNegativeInt(seedInput, demand?.seed ?? 42)
         const normalizedTick = parseNonNegativeInt(tickInput, simState?.tick ?? 0)
         setSeedInput(String(normalizedSeed))
         setTickInput(String(normalizedTick))
 
         requestInit.headers = { "Content-Type": "application/json" }
-        requestInit.body = JSON.stringify({ seed: normalizedSeed, tick: normalizedTick, agent_mode: agentMode })
+        requestInit.body = JSON.stringify({
+          seed: normalizedSeed,
+          tick: normalizedTick,
+          agent_mode: agentMode,
+          stress_profile_id: selectedStressProfile?.id ?? null,
+          stress_node_ids: selectedStressProfile ? selectedStressNodeIds : [],
+        })
       }
 
       const response = await fetch(`${API_BASE}/sim/${action}`, requestInit)
@@ -554,9 +665,19 @@ export default function Page() {
         laneCountRef.current = new Map()
         laneLoadRef.current = new Map()
         lastDemandTickRef.current = 0
+        setSelectedStressProfileId("none")
+        setSelectedStressNodeIds([])
+        if (kpiChartUrl) {
+          URL.revokeObjectURL(kpiChartUrl)
+        }
+        setKpiChartUrl("")
       } else if (action === "start") {
         setSimStreamError("")
         setDemandStreamError("")
+        if (kpiChartUrl) {
+          URL.revokeObjectURL(kpiChartUrl)
+        }
+        setKpiChartUrl("")
       }
     } catch (err) {
       const msg = (err as Error).message
@@ -646,11 +767,11 @@ export default function Page() {
     if (!world) {
       return { nodes: [], edges: [] }
     }
-    return buildWorldGraph(world, highlightedRegion, simState, node => {
+    return buildWorldGraph(world, highlightedRegion, simState, selectedStressNodeSet, stressSelectionActive, node => {
       setSelectedEdgeCorridor(null)
       setSelectedNodeId(node.id)
     })
-  }, [world, highlightedRegion, simState])
+  }, [world, highlightedRegion, simState, selectedStressNodeSet, stressSelectionActive])
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -670,9 +791,35 @@ export default function Page() {
     setEdges(graph.edges)
   }, [graph, setNodes, setEdges])
 
+  useEffect(() => {
+    async function refreshKpiChart() {
+      if (!simState || simState.running) {
+        return
+      }
+      try {
+        const response = await fetch(`${API_BASE}/sim/kpi-chart`, { cache: "no-store" })
+        if (!response.ok) {
+          return
+        }
+        const blob = await response.blob()
+        const nextUrl = URL.createObjectURL(blob)
+        setKpiChartUrl(prev => {
+          if (prev) {
+            URL.revokeObjectURL(prev)
+          }
+          return nextUrl
+        })
+      } catch {
+        return
+      }
+    }
+
+    void refreshKpiChart()
+  }, [simState?.running, simState?.tick])
+
   return (
     <main className="grid min-h-svh place-items-center bg-gradient-to-br from-background via-background to-muted/40 p-6">
-      <section className="relative h-[84vh] w-full max-w-7xl overflow-hidden rounded-none border border-border bg-card">
+      <section className="relative h-[84vh] w-full max-w-[95vw] overflow-hidden rounded-none border border-border bg-card">
         {error ? (
           <div className="grid h-full place-items-center text-sm text-destructive">{error}</div>
         ) : !world ? (
@@ -698,6 +845,47 @@ export default function Page() {
 
               <div className="min-h-0 flex-1 overflow-y-auto p-3">
                 <div className="text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">DEMAND LOGS</div>
+                {!simState?.running ? (
+                  <div className="mt-2 rounded-none border border-border/60 bg-background/25 p-2">
+                    <div className="text-[10px] font-semibold tracking-[0.08em] text-muted-foreground">STRESS PROFILE</div>
+                    <select
+                      className="mt-1 h-7 w-full rounded-none border border-border/70 bg-background/35 px-2 text-[11px] text-foreground outline-none focus:border-foreground/50"
+                      value={selectedStressProfileId}
+                      onChange={event => {
+                        setSelectedStressProfileId(event.target.value)
+                        setSelectedStressNodeIds([])
+                      }}
+                    >
+                      <option value="none">None (normal run)</option>
+                      {stressProfiles.map(profile => (
+                        <option key={profile.id} value={profile.id}>{profile.label}</option>
+                      ))}
+                    </select>
+
+                    {selectedStressProfile ? (
+                      <div className="mt-2 space-y-1 text-[10px] text-foreground/90">
+                        <div>Required nodes: {selectedStressProfile.required_nodes}</div>
+                        <div>Selected: {selectedStressNodeIds.length}/{selectedStressProfile.required_nodes}</div>
+                        <div className="max-h-20 overflow-y-auto rounded-none border border-border/50 bg-background/30 p-1">
+                          {selectedStressProfile.events.map((event, index) => (
+                            <div key={`${event.tick}-${event.slot_index}-${index}`} className="leading-4 text-muted-foreground">
+                              T+{event.tick} - slot {event.slot_index + 1} +{event.shipment_count}
+                            </div>
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          className="w-full rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-medium text-foreground hover:bg-foreground/10"
+                          onClick={() => setSelectedStressNodeIds([])}
+                        >
+                          Clear stress node selection
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="mt-1 text-[10px] text-muted-foreground">No deterministic stress profile selected.</div>
+                    )}
+                  </div>
+                ) : null}
                 <div className="mt-2 space-y-1.5">
                   {demandLogs.length === 0 ? (
                     <div className="rounded-none border border-border/60 bg-background/25 px-2 py-2 text-xs text-muted-foreground">
@@ -749,6 +937,28 @@ export default function Page() {
                   edges={edges}
                   onNodesChange={onNodesChange}
                   onEdgesChange={onEdgesChange}
+                  onNodeClick={(_, node) => {
+                    const nodeId = node.id
+                    if (!stressSelectionActive) {
+                      return
+                    }
+
+                    setSelectedStressNodeIds(prev => {
+                      const exists = prev.includes(nodeId)
+                      if (exists) {
+                        return prev.filter(id => id !== nodeId)
+                      }
+
+                      const required = selectedStressProfile?.required_nodes ?? 0
+                      if (required <= 0) {
+                        return prev
+                      }
+                      if (prev.length >= required) {
+                        return prev
+                      }
+                      return [...prev, nodeId]
+                    })
+                  }}
                   onEdgeContextMenu={(event, edge) => {
                     event.preventDefault()
                     setSelectedNodeId(null)
@@ -772,7 +982,7 @@ export default function Page() {
               </div>
             </div>
 
-            <aside className="flex w-64 flex-col border-l border-border/80 bg-card/95">
+            <aside className="flex w-80 flex-col border-l border-border/80 bg-card/95">
               <div className="flex items-center border-b border-border/70">
                 <div
                   ref={agentSliderRef}
@@ -888,7 +1098,8 @@ export default function Page() {
                   <button
                     type="button"
                     onClick={() => controlSimulation("start")}
-                    className="rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-medium text-foreground hover:bg-foreground/10"
+                    disabled={!stressSelectionReady}
+                    className="rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-medium text-foreground hover:bg-foreground/10 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     Start
                   </button>
@@ -907,7 +1118,12 @@ export default function Page() {
                     Clear
                   </button>
                 </div>
-              <div className="grid grid-cols-2 gap-2 border-b border-border/70 p-3 text-xs">
+                <div className="grid grid-cols-2 gap-2 border-b border-border/70 p-3 text-xs">
+                {!stressSelectionReady ? (
+                  <div className="col-span-2 rounded-none border border-amber-400/40 bg-amber-400/10 p-2 text-[10px] text-amber-200">
+                    Select {selectedStressProfile?.required_nodes ?? 0} stress nodes on graph to enable Start.
+                  </div>
+                ) : null}
                 <div className="rounded-none border border-border/70 bg-background/40 p-2">
                   <div className="text-[10px] text-muted-foreground">Status</div>
                   <div className="text-sm font-semibold">{simState?.failed ? "Failed" : simState?.running ? "Running" : "Paused"}</div>
@@ -968,11 +1184,59 @@ export default function Page() {
                 {simStreamError ? <div className="mt-3 text-[11px] text-amber-400">{simStreamError}</div> : null}
               </div>
             </aside>
+
+            <aside className="flex w-52 flex-col border-l border-border/80 bg-card/95">
+              <div className="border-b border-border/70 px-3 py-2 text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">
+                KPI SNAPSHOT
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto p-3">
+                <div className="grid grid-cols-1 gap-2 text-xs">
+                  <div className="rounded-none border border-border/70 bg-background/35 p-2">
+                    <div className="text-[10px] text-muted-foreground">Delivered %</div>
+                    <div className="text-sm font-semibold">{kpiSnapshot.deliveredPct.toFixed(1)}%</div>
+                  </div>
+                  <div className="rounded-none border border-border/70 bg-background/35 p-2">
+                    <div className="text-[10px] text-muted-foreground">Backlog %</div>
+                    <div className="text-sm font-semibold">{kpiSnapshot.backlogPct.toFixed(1)}%</div>
+                  </div>
+                  <div className="rounded-none border border-border/70 bg-background/35 p-2">
+                    <div className="text-[10px] text-muted-foreground">Full Nodes %</div>
+                    <div className="text-sm font-semibold">{kpiSnapshot.fullNodePct.toFixed(1)}%</div>
+                  </div>
+                  <div className="rounded-none border border-border/70 bg-background/35 p-2">
+                    <div className="text-[10px] text-muted-foreground">Avg Node Util</div>
+                    <div className="text-sm font-semibold">{kpiSnapshot.avgNodeUtilPct.toFixed(1)}%</div>
+                  </div>
+                  <div className="rounded-none border border-border/70 bg-background/35 p-2">
+                    <div className="text-[10px] text-muted-foreground">Blocked Admission</div>
+                    <div className="text-sm font-semibold">{kpiSnapshot.blockedAdmission}</div>
+                  </div>
+                  <div className="rounded-none border border-border/70 bg-background/35 p-2">
+                    <div className="text-[10px] text-muted-foreground">Moved Load</div>
+                    <div className="text-sm font-semibold">{kpiSnapshot.movedLoad.toFixed(1)}t</div>
+                  </div>
+                </div>
+                {!simState?.running && kpiChartUrl ? (
+                  <div className="mt-2 rounded-none border border-border/60 bg-background/25 p-2">
+                    <div className="text-[10px] font-semibold tracking-[0.08em] text-muted-foreground">KPI VS TIME</div>
+                    <a
+                      href={kpiChartUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mt-1 block overflow-hidden rounded-none border border-border/60 hover:border-foreground/40"
+                      title="Open KPI timeline image in new tab"
+                    >
+                      <img src={kpiChartUrl} alt="KPI versus time" className="pointer-events-none block w-full" />
+                    </a>
+                  </div>
+                ) : null}
+              </div>
+            </aside>
           </div>
         )}
 
         {selectedNodeDetails ? (
-          <div className="absolute right-72 top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
+          <div className="absolute right-[calc(20rem+13rem)] top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
             <div className="mb-2 flex items-start justify-between gap-2 border-b border-border/70 pb-2">
               <div>
                 <div className="font-semibold text-foreground">{selectedNodeDetails.code} - {selectedNodeDetails.name}</div>
@@ -1013,7 +1277,7 @@ export default function Page() {
         ) : null}
 
         {selectedEdgeDetails ? (
-          <div className="absolute right-72 top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
+          <div className="absolute right-[calc(20rem+13rem)] top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
             <div className="mb-2 flex items-start justify-between gap-2 border-b border-border/70 pb-2">
               <div>
                 <div className="font-semibold text-foreground">{selectedEdgeDetails.sourceCode} &lt;-&gt; {selectedEdgeDetails.targetCode}</div>

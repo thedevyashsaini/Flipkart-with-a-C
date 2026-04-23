@@ -45,9 +45,9 @@ class HoldingShipment:
 
 
 class SimulatorCore:
-    FAILURE_FULL_NODE_THRESHOLD = 2
+    FAILURE_FULL_NODE_THRESHOLD = 3
     FULL_NODE_UTILIZATION_THRESHOLD = 0.98
-    FAILURE_SUSTAINED_TICKS = 6
+    FAILURE_SUSTAINED_TICKS = 1
     WITH_C_ADDITIONAL_COST_THRESHOLD = 220.0
     WITH_C_MAX_HOLD_SHARE = 0.08
     WITH_C_FORCE_FORWARD_SOURCE_PRESSURE = 0.72
@@ -83,6 +83,7 @@ class SimulatorCore:
         self._in_transit: list[InTransitShipment] = []
         self._holding: list[HoldingShipment] = []
         self._pending_admission: dict[str, deque[SimShipment]] = defaultdict(deque)
+        self._stress_plan_by_tick: dict[int, list[tuple[str, int]]] = defaultdict(list)
         self._consumed_shipments = 0
         self._consumed_shipments_tick_by_node: dict[str, int] = {}
         self._pending_admitted_tick_by_node: dict[str, int] = {}
@@ -94,6 +95,7 @@ class SimulatorCore:
         self._last_edge_move_loads: dict[str, float] = {}
         self._additional_cost = 0.0
         self._overload_streak = 0
+        self._kpi_history: list[dict[str, float | int]] = []
         self._latest_state = SimulationState(
             agent_mode=self._agent_mode,
             tick=0,
@@ -162,6 +164,7 @@ class SimulatorCore:
             self._last_edge_move_loads = {}
             self._additional_cost = 0.0
             self._overload_streak = 0
+            self._kpi_history = []
             self._latest_state = self._build_state(0, 0, 0, 0.0)
 
         for _ in range(start_tick):
@@ -170,6 +173,19 @@ class SimulatorCore:
     def get_state(self) -> SimulationState:
         with self._state_lock:
             return self._latest_state
+
+    def get_kpi_history(self) -> list[dict[str, float | int]]:
+        with self._state_lock:
+            return [dict(item) for item in self._kpi_history]
+
+    def set_stress_plan(self, plan: list[tuple[int, str, int]]) -> None:
+        mapped: dict[int, list[tuple[str, int]]] = defaultdict(list)
+        for tick, node_id, shipment_count in plan:
+            if tick <= 0 or shipment_count <= 0:
+                continue
+            mapped[tick].append((node_id, shipment_count))
+        with self._state_lock:
+            self._stress_plan_by_tick = defaultdict(list, mapped)
 
     def _run_forever(self) -> None:
         while True:
@@ -184,6 +200,7 @@ class SimulatorCore:
             if advance_demand:
                 self._demand_generator.advance_one_tick()
             self._tick += 1
+            self._apply_stress_events_for_tick(self._tick)
             blocked_admission_tick = self._retry_pending_admission()
             new_demands = self._demand_generator.drain_new_shipments()
             generated_shipments, blocked_new = self._ingest_demands(new_demands)
@@ -196,6 +213,34 @@ class SimulatorCore:
             self._evaluate_failure()
 
             self._latest_state = self._build_state(generated_shipments, blocked_admission_tick, moved_shipments_tick, moved_load_tick)
+            self._record_kpi_point(self._latest_state)
+
+    def _record_kpi_point(self, state: SimulationState) -> None:
+        total_generated = self._demand_generator.get_state().total_generated
+        backlog = state.queued_shipments + state.in_transit_shipments + state.holding_shipments
+        node_count = max(1, len(self._world.nodes))
+
+        sum_util = 0.0
+        for stat in state.node_stats.values():
+            if stat.capacity <= 0:
+                continue
+            sum_util += stat.active_load_tons / stat.capacity
+
+        point = {
+            "tick": state.tick,
+            "delivered_pct": (state.consumed_shipments / total_generated) * 100 if total_generated > 0 else 0.0,
+            "backlog_pct": (backlog / total_generated) * 100 if total_generated > 0 else 0.0,
+            "full_node_pct": (state.full_nodes / node_count) * 100,
+            "avg_node_util_pct": (sum_util / node_count) * 100,
+        }
+
+        if self._kpi_history and int(self._kpi_history[-1].get("tick", -1)) == state.tick:
+            self._kpi_history[-1] = point
+        else:
+            self._kpi_history.append(point)
+
+        if len(self._kpi_history) > 1200:
+            self._kpi_history = self._kpi_history[-1200:]
 
     def _build_state(self, generated_shipments: int, blocked_admission_tick: int, moved_shipments_tick: int, moved_load_tick: float) -> SimulationState:
         return SimulationState(
@@ -645,7 +690,7 @@ class SimulatorCore:
     def _evaluate_failure(self) -> None:
         full_node_ids = self._full_node_ids()
         full_nodes = len(full_node_ids)
-        if full_nodes > self.FAILURE_FULL_NODE_THRESHOLD:
+        if full_nodes >= self.FAILURE_FULL_NODE_THRESHOLD:
             self._overload_streak += 1
         else:
             self._overload_streak = 0
@@ -722,6 +767,26 @@ class SimulatorCore:
         self._recent_logs.insert(0, SimulationLog(tick=self._tick, message=message))
         if len(self._recent_logs) > 250:
             self._recent_logs = self._recent_logs[:250]
+
+    def _apply_stress_events_for_tick(self, tick: int) -> None:
+        events = self._stress_plan_by_tick.pop(tick, [])
+        if not events:
+            return
+
+        total_injected = 0
+        targets: list[str] = []
+        for node_id, shipment_count in events:
+            injected = self._demand_generator.inject_destination_spike(node_id, shipment_count=shipment_count)
+            if injected <= 0:
+                continue
+            total_injected += injected
+            targets.append(self._node_name.get(node_id, node_id))
+
+        if total_injected > 0:
+            self._push_log(
+                f"stress profile injected {total_injected} shipments at tick {tick} "
+                f"into {', '.join(targets)}"
+            )
 
     def _validate_mass_balance(self) -> None:
         queue_count = 0
