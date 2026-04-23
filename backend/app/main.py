@@ -86,6 +86,16 @@ STRESS_PROFILES: dict[str, StressProfile] = {
             StressEventTemplate(tick=50, slot_index=0, shipment_count=8),
         ],
     ),
+    "profile_fail": StressProfile(
+        id="profile_fail",
+        label="Profile FAIL - with-c survival test",
+        required_nodes=3,
+        events=[
+            StressEventTemplate(tick=30, slot_index=0, shipment_count=392),
+            StressEventTemplate(tick=30, slot_index=1, shipment_count=392),
+            StressEventTemplate(tick=30, slot_index=2, shipment_count=392),
+        ],
+    ),
 }
 
 

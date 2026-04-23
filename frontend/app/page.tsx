@@ -469,7 +469,6 @@ export default function Page() {
     const backlog = queued + inTransit + holding
     const moved = simState?.moved_shipments_tick ?? 0
     const movedLoad = simState?.moved_load_tick ?? 0
-    const blockedAdmission = simState?.blocked_admission_tick ?? 0
     const fullNodes = simState?.full_nodes ?? 0
     const nodeCount = world?.nodes.length ?? 0
 
@@ -499,7 +498,6 @@ export default function Page() {
       avgNodeUtilPct,
       moved,
       movedLoad,
-      blockedAdmission,
     }
   }, [demand, simState, world])
   useEffect(() => {
@@ -1206,10 +1204,6 @@ export default function Page() {
                   <div className="rounded-none border border-border/70 bg-background/35 p-2">
                     <div className="text-[10px] text-muted-foreground">Avg Node Util</div>
                     <div className="text-sm font-semibold">{kpiSnapshot.avgNodeUtilPct.toFixed(1)}%</div>
-                  </div>
-                  <div className="rounded-none border border-border/70 bg-background/35 p-2">
-                    <div className="text-[10px] text-muted-foreground">Blocked Admission</div>
-                    <div className="text-sm font-semibold">{kpiSnapshot.blockedAdmission}</div>
                   </div>
                   <div className="rounded-none border border-border/70 bg-background/35 p-2">
                     <div className="text-[10px] text-muted-foreground">Moved Load</div>
