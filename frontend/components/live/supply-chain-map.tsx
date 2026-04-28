@@ -22,6 +22,7 @@ type LiveNode = {
   avg_hold_ticks_per_ton: number
   x: number
   y: number
+  status?: "active" | "flushed"
 }
 
 type LiveEdge = {
@@ -48,22 +49,44 @@ const TYPE_STYLE: Record<LiveNode["type"], string> = {
   city: "border-violet-500/30 bg-violet-500/10 text-violet-100",
 }
 
+const TYPE_STYLE_FLUSHED: Record<LiveNode["type"], string> = {
+  hub: "border-neutral-600/50 bg-neutral-800/50 text-neutral-400",
+  warehouse: "border-neutral-600/50 bg-neutral-800/50 text-neutral-400",
+  airport: "border-neutral-600/50 bg-neutral-800/50 text-neutral-400",
+  city: "border-neutral-600/50 bg-neutral-800/50 text-neutral-400",
+}
+
 type LiveNodeData = {
   code: string
   type: LiveNode["type"]
+  status?: "active" | "flushed"
+  onContextMenu?: (nodeId: string, nodeName: string, nodeType: string, status?: string) => void
 }
 
-function LiveWorldNode({ data }: NodeProps<Node<LiveNodeData>>) {
+function LiveWorldNode({ data, id }: NodeProps<Node<LiveNodeData>>) {
   const heat = 0
   const heatShadow = `0 10px 24px rgba(0,0,0,0.28), 0 0 ${10 + heat * 24}px rgba(245, 158, 11, ${0.12 + heat * 0.32})`
+  const isFlushed = data.status === "flushed"
+
+  const baseStyle = isFlushed ? TYPE_STYLE_FLUSHED[data.type] : TYPE_STYLE[data.type]
+  const borderStyle = isFlushed ? "border-dashed" : ""
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (data.onContextMenu) {
+      data.onContextMenu(id, data.code, data.type, data.status)
+    }
+  }
 
   return (
     <div
-      className={`relative min-w-24 rounded-xl border px-3 py-2 text-center transition-[opacity,box-shadow,filter,border-color] duration-150 ${TYPE_STYLE[data.type]} opacity-100`}
+      className={`relative min-w-24 rounded-xl border px-3 py-2 text-center transition-[opacity,box-shadow,filter,border-color] duration-150 ${baseStyle} ${borderStyle} ${isFlushed ? "opacity-50 grayscale-[0.4]" : "opacity-100"}`}
       style={{
-        boxShadow: heatShadow,
-        filter: `saturate(${1 + heat * 0.35}) brightness(${1 + heat * 0.2})`,
+        boxShadow: isFlushed ? undefined : heatShadow,
+        filter: isFlushed ? "grayscale(0.5)" : `saturate(${1 + heat * 0.35}) brightness(${1 + heat * 0.2})`,
       }}
+      onContextMenu={handleContextMenu}
     >
       <Handle id="t-top" type="target" position={Position.Top} isConnectable={false} className="!size-2 !border !border-white/80 !bg-black" />
       <Handle id="s-top" type="source" position={Position.Top} isConnectable={false} className="!size-2 !border !border-white/80 !bg-black" />
@@ -103,7 +126,17 @@ function toCode(name: string, type: LiveNode["type"]): string {
   return `${cityPart}${typePart}`
 }
 
-export function SupplyChainMap({ nodes, edges, shipments = [] }: { nodes: LiveNode[]; edges: LiveEdge[]; shipments?: LiveShipment[] }) {
+export function SupplyChainMap({
+  nodes,
+  edges,
+  shipments = [],
+  onNodeContextMenu,
+}: {
+  nodes: LiveNode[]
+  edges: LiveEdge[]
+  shipments?: LiveShipment[]
+  onNodeContextMenu?: (nodeId: string, nodeName: string, nodeType: string, status?: string) => void
+}) {
   const positionById = useMemo(() => {
     const map = new Map<string, { x: number; y: number }>()
     nodes.forEach(node => {
@@ -117,10 +150,15 @@ export function SupplyChainMap({ nodes, edges, shipments = [] }: { nodes: LiveNo
       id: node.id,
       type: "worldNode",
       position: { x: node.x, y: node.y },
-      data: { code: toCode(node.name, node.type), type: node.type },
+      data: {
+        code: toCode(node.name, node.type),
+        type: node.type,
+        status: node.status,
+        onContextMenu: onNodeContextMenu,
+      },
       draggable: false,
     }))
-  }, [nodes])
+  }, [nodes, onNodeContextMenu])
 
   const rfEdges = useMemo<Edge[]>(() => {
     const activeLaneCounts = new Map<string, number>()

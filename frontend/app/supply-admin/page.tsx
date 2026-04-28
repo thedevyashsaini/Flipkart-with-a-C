@@ -1,9 +1,17 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, useCallback } from "react"
 
 import { LiveTopNav } from "@/app/live-layout"
 import { SupplyChainMap } from "@/components/live/supply-chain-map"
+import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"
 
@@ -127,6 +135,8 @@ export default function SupplyAdminPage() {
   const [decisionExplanations, setDecisionExplanations] = useState<Record<string, string>>({})
   const [loadingExplainDecisionId, setLoadingExplainDecisionId] = useState<string | null>(null)
   const [tokensOpen, setTokensOpen] = useState(false)
+  const [contextMenuNode, setContextMenuNode] = useState<{ id: string; name: string; type: string; status?: string } | null>(null)
+  const [flushingNode, setFlushingNode] = useState<string | null>(null)
   const nodeCodeById = new Map(previewNodes.map(node => [node.id, toCode(node.name, node.type)]))
   const timelineItems: SupplyTimelineItem[] = [
     ...suggestions.map(item => ({
@@ -333,13 +343,66 @@ export default function SupplyAdminPage() {
     }
   }
 
+  const handleNodeContextMenu = useCallback((nodeId: string, nodeName: string, nodeType: string, status?: string) => {
+    setContextMenuNode({ id: nodeId, name: nodeName, type: nodeType, status })
+  }, [])
+
+  async function handleFlushNode() {
+    if (!contextMenuNode || !adminKey || !chainId) {
+      return
+    }
+    const nodeId = contextMenuNode.id
+    setFlushingNode(nodeId)
+    setContextMenuNode(null)
+    try {
+      const response = await fetch(`${API_BASE}/live/chains/${chainId}/nodes/${nodeId}/flush`, {
+        method: "POST",
+        headers: { "X-Admin-Api-Key": adminKey },
+      })
+      const payload = await response.json() as { ok?: boolean; detail?: string }
+      if (!response.ok) {
+        throw new Error(payload.detail || `flush failed (${response.status})`)
+      }
+      cachedRemove(`live.nodes`)
+      await refreshLiveData()
+    } catch (err) {
+      setError(`Flush failed: ${(err as Error).message}`)
+    } finally {
+      setFlushingNode(null)
+    }
+  }
+
+  async function handleReopenNode() {
+    if (!contextMenuNode || !adminKey || !chainId) {
+      return
+    }
+    const nodeId = contextMenuNode.id
+    setFlushingNode(nodeId)
+    setContextMenuNode(null)
+    try {
+      const response = await fetch(`${API_BASE}/live/chains/${chainId}/nodes/${nodeId}/reopen`, {
+        method: "POST",
+        headers: { "X-Admin-Api-Key": adminKey },
+      })
+      const payload = await response.json() as { ok?: boolean; detail?: string }
+      if (!response.ok) {
+        throw new Error(payload.detail || `reopen failed (${response.status})`)
+      }
+      await refreshLiveData()
+    } catch (err) {
+      setError(`Reopen failed: ${(err as Error).message}`)
+    } finally {
+      setFlushingNode(null)
+    }
+  }
+
   return (
     <main className="grid min-h-svh place-items-center bg-gradient-to-br from-background via-background to-muted/40 p-6">
       <section className="relative h-[84vh] w-full max-w-[96vw] overflow-hidden rounded-none border border-border bg-card">
         <LiveTopNav />
         <div className="flex h-[calc(100%-2.5rem)] min-h-0">
           <section className="flex min-w-0 flex-1 flex-col border-r border-border/80 bg-card/95">
-            <SupplyChainMap nodes={previewNodes} edges={previewEdges} shipments={shipments} />
+            <SupplyChainMap nodes={previewNodes} edges={previewEdges} shipments={shipments} onNodeContextMenu={handleNodeContextMenu} />
             <div className="border-t border-border/70 bg-card/95 px-3 py-1 text-[9px] text-muted-foreground">
               Live graph preview | Nodes load after valid JSON | Edges appear when valid
             </div>
@@ -461,6 +524,38 @@ export default function SupplyAdminPage() {
                 )}
               </aside>
               {error ? <div className="absolute bottom-0 right-12 border-l border-t border-border/70 bg-card/95 p-2 text-[10px] text-amber-300">{error}</div> : null}
+
+              <Dialog open={!!contextMenuNode} onOpenChange={(open: boolean) => !open && setContextMenuNode(null)}>
+                <DialogContent className="max-w-sm rounded-none border border-border/80 bg-card/95 p-4">
+                  <DialogHeader>
+                    <DialogTitle className="text-sm font-semibold tracking-wide">
+                      {contextMenuNode?.name || contextMenuNode?.id}
+                    </DialogTitle>
+                    <DialogDescription className="text-[10px]">
+                      {contextMenuNode?.status === "flushed" ? "Node is currently flushed" : "Node is active"}
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="mt-2 flex flex-col gap-2">
+                    {contextMenuNode?.status === "flushed" ? (
+                      <Button
+                        onClick={handleReopenNode}
+                        disabled={!!flushingNode}
+                        className="w-full rounded-none border border-emerald-500/40 bg-emerald-500/15 text-[10px] font-semibold text-emerald-200 hover:bg-emerald-500/25"
+                      >
+                        {flushingNode ? "Reopening..." : "Reopen Node"}
+                      </Button>
+                    ) : (
+                      <Button
+                        onClick={handleFlushNode}
+                        disabled={!!flushingNode}
+                        className="w-full rounded-none border border-rose-500/40 bg-rose-500/15 text-[10px] font-semibold text-rose-200 hover:bg-rose-500/25"
+                      >
+                        {flushingNode ? "Flushing..." : "Flush Node"}
+                      </Button>
+                    )}
+                  </div>
+                </DialogContent>
+              </Dialog>
             </>
           )}
         </div>

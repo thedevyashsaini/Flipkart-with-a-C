@@ -23,17 +23,36 @@ class WithCAgent:
     FORECAST_HORIZON_PAD = 2
     TREND_WEIGHT = 0.08
 
-    def __init__(self, world: World) -> None:
-        self._node_by_id = {node.id: node for node in world.nodes}
-        self._adj: dict[str, list[PlannedHop]] = {node.id: [] for node in world.nodes}
-        self._rev_adj: dict[str, list[tuple[str, float]]] = {node.id: [] for node in world.nodes}
+    def __init__(self, world: World, flushed_nodes: set[str] | None = None) -> None:
+        self._flushed_nodes = flushed_nodes or set()
+        self._node_by_id = {node.id: node for node in world.nodes if node.id not in self._flushed_nodes}
+        self._adj: dict[str, list[PlannedHop]] = {node.id: [] for node in world.nodes if node.id not in self._flushed_nodes}
+        self._rev_adj: dict[str, list[tuple[str, float]]] = {node.id: [] for node in world.nodes if node.id not in self._flushed_nodes}
         for edge in world.edges:
+            if edge.source in self._flushed_nodes or edge.target in self._flushed_nodes:
+                continue
             hop = PlannedHop(source=edge.source, target=edge.target, base_eta=edge.base_eta, base_cost=edge.base_cost)
             self._adj.setdefault(edge.source, []).append(hop)
             self._rev_adj.setdefault(edge.target, []).append((edge.source, edge.base_cost))
 
         self._distance_cache: dict[str, dict[str, float]] = {}
         self._baseline_hop_cache: dict[tuple[str, str], PlannedHop | None] = {}
+
+    def update_world(self, nodes: list[dict[str, object]], edges: list[dict[str, object]]) -> None:
+        self._flushed_nodes = {str(n["id"]) for n in nodes if n.get("status") == "flushed"}
+        self._node_by_id = {str(n["id"]): n for n in nodes if n.get("status") != "flushed"}
+        self._adj = {node_id: [] for node_id in self._node_by_id}
+        self._rev_adj = {node_id: [] for node_id in self._node_by_id}
+        for edge in edges:
+            source = str(edge.get("source", ""))
+            target = str(edge.get("target", ""))
+            if source in self._flushed_nodes or target in self._flushed_nodes:
+                continue
+            hop = PlannedHop(source=source, target=target, base_eta=edge.get("base_eta", 1), base_cost=edge.get("base_cost", 1))
+            self._adj.setdefault(source, []).append(hop)
+            self._rev_adj.setdefault(target, []).append((source, edge.get("base_cost", 1)))
+        self._distance_cache.clear()
+        self._baseline_hop_cache.clear()
 
     def decide(
         self,

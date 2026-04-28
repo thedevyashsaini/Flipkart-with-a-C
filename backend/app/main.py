@@ -298,6 +298,7 @@ def load_live_chain(client: firestore.Client, chain_id: str) -> dict[str, object
 def live_agent(chain_id: str, nodes: list[dict[str, object]], edges: list[dict[str, object]]) -> WithCAgent:
     cached = with_c_agent_cache.get(chain_id)
     if cached is not None:
+        cached.update_world(nodes, edges)
         return cached
     world = World.model_validate({"nodes": nodes, "edges": edges})
     agent = WithCAgent(world)
@@ -326,11 +327,12 @@ def compute_pressure_maps_live(
     edges: list[dict[str, object]],
     shipments: dict[str, dict[str, object]],
 ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
-    inbound: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
-    outbound: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
-    queued: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
-    holding: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
-    in_transit_to: dict[str, float] = {str(node["id"]): 0.0 for node in nodes}
+    active_nodes = [n for n in nodes if n.get("status") != "flushed"]
+    inbound: dict[str, float] = {str(node["id"]): 0.0 for node in active_nodes}
+    outbound: dict[str, float] = {str(node["id"]): 0.0 for node in active_nodes}
+    queued: dict[str, float] = {str(node["id"]): 0.0 for node in active_nodes}
+    holding: dict[str, float] = {str(node["id"]): 0.0 for node in active_nodes}
+    in_transit_to: dict[str, float] = {str(node["id"]): 0.0 for node in active_nodes}
 
     for shipment in shipments.values():
         state = str(shipment.get("state", "queued"))
@@ -355,7 +357,7 @@ def compute_pressure_maps_live(
     pressure: dict[str, float] = {}
     projected: dict[str, float] = {}
     flow_trend: dict[str, float] = {}
-    for node in nodes:
+    for node in active_nodes:
         node_id = str(node["id"])
         cap = max(1.0, float(node.get("capacity", 1.0) or 1.0))
         current = queued.get(node_id, 0.0) + 0.22 * holding.get(node_id, 0.0)
@@ -761,14 +763,19 @@ def simulation_explain_log(payload: ExplainLogRequest) -> dict[str, str | int | 
             try:
                 with urllib.request.urlopen(fallback_request, timeout=20) as response:
                     data = json.loads(response.read().decode("utf-8"))
-            except urllib.error.HTTPError as fallback_err:
-                fallback_detail = fallback_err.read().decode("utf-8", errors="replace")
-                raise HTTPException(status_code=502, detail=f"Gemini request failed: {fallback_detail}") from fallback_err
-            except urllib.error.URLError as fallback_err:
-                raise HTTPException(status_code=502, detail=f"Gemini request failed: {fallback_err.reason}") from fallback_err
+            except Exception as fallback_err:
+                if log and log.message:
+                    return {"ok": True, "log_id": payload.log_id, "explanation": f"Counterfactual WITH C: {log.message}", "cached": False}
+                raise HTTPException(status_code=503, detail=f"Gemini unavailable: {fallback_err}") from fallback_err
+        elif err.code in {429, 500, 503}:
+            if log and log.message:
+                return {"ok": True, "log_id": payload.log_id, "explanation": f"Counterfactual WITH C: {log.message}", "cached": False}
+            raise HTTPException(status_code=503, detail=f"Gemini unavailable: {detail}") from err
         else:
             raise HTTPException(status_code=502, detail=f"Gemini request failed: {detail}") from err
     except urllib.error.URLError as err:
+        if log and log.message:
+            return {"ok": True, "log_id": payload.log_id, "explanation": f"Counterfactual WITH C: {log.message}", "cached": False}
         raise HTTPException(status_code=502, detail=f"Gemini request failed: {err.reason}") from err
 
     explanation = ""
@@ -1134,9 +1141,12 @@ def live_ingest_event(payload: LiveNodeEventRequest, authorization: str | None =
         raise HTTPException(status_code=400, detail="Load is required for shipment creation")
 
     resolved_priority = payload.priority.value if payload.priority is not None else str(shipment_existing_data.get("priority", ShipmentPriority.MEDIUM.value))
-    resolved_deadline = payload.deadline_tick if payload.deadline_tick is not None else shipment_existing_data.get("deadline_tick")
-    if resolved_deadline is None:
-        resolved_deadline = 0
+    if payload.deadline_tick is not None:
+        resolved_deadline = payload.deadline_tick
+    elif shipment_existing_data.get("deadline_tick") is not None:
+        resolved_deadline = shipment_existing_data.get("deadline_tick")
+    else:
+        resolved_deadline = int(datetime.now(timezone.utc).timestamp()) + 86400
 
     resolved_source = payload.source_node_id or str(shipment_existing_data.get("source_node_id", payload.current_node_id))
     resolved_destination = payload.destination_node_id or str(shipment_existing_data.get("destination_node_id", payload.current_node_id))
@@ -1285,8 +1295,14 @@ def live_explain_decision(decision_id: str, payload: LiveExplainDecisionRequest,
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf-8", errors="replace")
+        if err.code in {429, 500, 503}:
+            if decision and decision.get("reason"):
+                return {"ok": True, "decision_id": decision_id, "explanation": f"Recommendation: {decision.get('reason', 'See suggestion')}", "cached": False}
+            raise HTTPException(status_code=503, detail=f"Gemini unavailable: {detail}") from err
         raise HTTPException(status_code=502, detail=f"Gemini request failed: {detail}") from err
     except urllib.error.URLError as err:
+        if decision and decision.get("reason"):
+            return {"ok": True, "decision_id": decision_id, "explanation": f"Recommendation: {decision.get('reason', 'See suggestion')}", "cached": False}
         raise HTTPException(status_code=502, detail=f"Gemini request failed: {err.reason}") from err
 
     explanation = ""
@@ -1329,3 +1345,107 @@ def demand_inject(node_id: str) -> dict[str, int | bool | str]:
         raise HTTPException(status_code=404, detail=f"Unknown destination node: {node_id}")
 
     return {"ok": True, "node_id": node_id, "injected": injected}
+
+
+def _find_warehouses_for_hub(nodes: list[dict], edges: list[dict], hub_id: str) -> list[str]:
+    warehouse_ids = set()
+    hub_node = next((n for n in nodes if str(n.get("id")) == hub_id), None)
+    if hub_node is None or hub_node.get("type") != "hub":
+        return []
+
+    for edge in edges:
+        source = str(edge.get("source", ""))
+        target = str(edge.get("target", ""))
+        if source == hub_id or target == hub_id:
+            other_id = target if source == hub_id else source
+            other_node = next((n for n in nodes if str(n.get("id")) == other_id), None)
+            if other_node and other_node.get("type") == "warehouse":
+                warehouse_ids.add(other_id)
+
+    return list(warehouse_ids)
+
+
+@app.post("/live/chains/{chain_id}/nodes/{node_id}/flush")
+def live_flush_node(chain_id: str, node_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    chain_ref = client.collection("supply_chains").document(chain_id)
+
+    live = load_live_chain(client, chain_id)
+    nodes = live["nodes"]
+    edges = live["edges"]
+
+    node_doc_ref = chain_ref.collection("nodes").document(node_id)
+    node_doc = node_doc_ref.get()
+    if not node_doc.exists:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    node_data = node_doc.to_dict() or {}
+    if node_data.get("status") == "flushed":
+        raise HTTPException(status_code=400, detail="Node is already flushed")
+
+    nodes_to_flush: list[str] = [node_id]
+    node_type = str(node_data.get("type", ""))
+
+    if node_type == "hub":
+        warehouse_ids = _find_warehouses_for_hub(nodes, edges, node_id)
+        nodes_to_flush.extend(warehouse_ids)
+
+    now = now_iso()
+    flushed_node_ids: list[str] = []
+
+    for nid in nodes_to_flush:
+        ref = chain_ref.collection("nodes").document(nid)
+        doc = ref.get()
+        if doc.exists and doc.to_dict().get("status") != "flushed":
+            ref.set({"status": "flushed", "flushed_at": now, "draining": True}, merge=True)
+            flushed_node_ids.append(nid)
+
+            shipment_docs = chain_ref.collection("shipments").where("current_node_id", "==", nid).stream()
+            for shipment in shipment_docs:
+                sdata = shipment.to_dict() or {}
+                sstate = str(sdata.get("state", "queued"))
+                target = str(sdata.get("target_node_id", ""))
+                if sstate in {"queued", "arrived", "holding"} and target:
+                    chain_ref.collection("shipments").document(shipment.id).set({
+                        "state": "in_transit",
+                        "updated_at": now,
+                    }, merge=True)
+
+    return {"ok": True, "chain_id": chain_id, "flushed_nodes": flushed_node_ids, "draining": True}
+
+
+@app.post("/live/chains/{chain_id}/nodes/{node_id}/reopen")
+def live_reopen_node(chain_id: str, node_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+    client = require_firestore()
+    chain_ref = client.collection("supply_chains").document(chain_id)
+
+    live = load_live_chain(client, chain_id)
+    nodes = live["nodes"]
+    edges = live["edges"]
+
+    node_doc_ref = chain_ref.collection("nodes").document(node_id)
+    node_doc = node_doc_ref.get()
+    if not node_doc.exists:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    node_data = node_doc.to_dict() or {}
+    node_type = str(node_data.get("type", ""))
+
+    nodes_to_reopen: list[str] = [node_id]
+
+    if node_type == "hub":
+        warehouse_ids = _find_warehouses_for_hub(nodes, edges, node_id)
+        nodes_to_reopen.extend(warehouse_ids)
+
+    reopened_node_ids: list[str] = []
+
+    for nid in nodes_to_reopen:
+        ref = chain_ref.collection("nodes").document(nid)
+        doc = ref.get()
+        if doc.exists and doc.to_dict().get("status") == "flushed":
+            ref.set({"status": "active", "draining": False}, merge=True)
+            reopened_node_ids.append(nid)
+
+    return {"ok": True, "chain_id": chain_id, "reopened_nodes": reopened_node_ids}
