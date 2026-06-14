@@ -1,6 +1,6 @@
+import concurrent.futures
 import json
 import os
-import time
 from collections import deque
 from pathlib import Path
 
@@ -52,14 +52,16 @@ class PressurePredictorInference:
         entry = {nid: (pressure.get(nid, 0.0), projected.get(nid, 0.0), trend.get(nid, 0.0)) for nid in self.node_ids}
         self._buffers[chain_id].append(entry)
 
-    def predict(self, chain_id: str) -> dict[str, dict[str, float]] | None:
+    def predict(self, chain_id: str, timeout_ms: int | None = None) -> dict[str, dict[str, float]] | None:
         buf = self._buffers.get(chain_id)
         if buf is None or len(buf) < self.seq_len:
             return None
 
+        timeout_ms = timeout_ms if timeout_ms is not None else int(os.getenv("AI_PREDICTION_TIMEOUT_MS", "50"))
+        timeout_s = timeout_ms / 1000.0
+
         last_entry = list(buf)[-1]
 
-        # Build input tensor from buffer
         features = np.zeros((self.seq_len, self.num_nodes * 3), dtype=np.float32)
         for t, entry in enumerate(list(buf)):
             for i, nid in enumerate(self.node_ids):
@@ -68,26 +70,30 @@ class PressurePredictorInference:
                 features[t, i * 3 + 1] = proj
                 features[t, i * 3 + 2] = tr
 
-        x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
-        x_norm = (x - self.feat_mean) / self.feat_std
+        def _infer() -> dict[str, dict[str, float]]:
+            x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+            x_norm = (x - self.feat_mean) / self.feat_std
+            with torch.no_grad():
+                pred_norm = self.model(x_norm)
+            pred = pred_norm * self.target_std.squeeze() + self.target_mean.squeeze()
+            pred = pred.clamp(min=0.0)
 
-        with torch.no_grad():
-            pred_norm = self.model(x_norm)
+            result = {}
+            for i, nid in enumerate(self.node_ids):
+                result[nid] = {
+                    "current": round(float(last_entry.get(nid, (0.0, 0.0, 0.0))[0]), 4),
+                    "p3": round(float(pred[0, i, 2].item()), 4),
+                    "p6": round(float(pred[0, i, 5].item()), 4),
+                    "p12": round(float(pred[0, i, 11].item()), 4),
+                }
+            return result
 
-        # Denormalize: pred_norm shape (1, num_nodes, horizon)
-        pred = pred_norm * self.target_std.squeeze() + self.target_mean.squeeze()
-        pred = pred.clamp(min=0.0)
-
-        result = {}
-        for i, nid in enumerate(self.node_ids):
-            result[nid] = {
-                "current": round(float(last_entry.get(nid, (0.0, 0.0, 0.0))[0]), 4),
-                "p3": round(float(pred[0, i, 2].item()), 4),
-                "p6": round(float(pred[0, i, 5].item()), 4),
-                "p12": round(float(pred[0, i, 11].item()), 4),
-            }
-
-        return result
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_infer)
+            try:
+                return future.result(timeout=timeout_s)
+            except concurrent.futures.TimeoutError:
+                return None
 
 
 # Global singleton
