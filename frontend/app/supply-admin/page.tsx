@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dialog"
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"
+const APP_URL = (process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000").replace(/\/+$/, "")
 
 type NodeInput = {
   id: string
@@ -65,13 +66,6 @@ type SupplyTimelineItem = {
   created_at: string
   message: string
   decision_id: string | null
-}
-
-function toCode(name: string, type: NodeInput["type"]): string {
-  const city = name.split(" ")[0]?.replace(/[^a-zA-Z]/g, "") || "NODE"
-  const cityPart = city.toUpperCase().slice(0, 3).padEnd(3, "X")
-  const typePart = type.slice(0, 1).toUpperCase()
-  return `${cityPart}${typePart}`
 }
 
 function formatTimestamp(value: string): string {
@@ -137,7 +131,7 @@ export default function SupplyAdminPage() {
   const [tokensOpen, setTokensOpen] = useState(false)
   const [contextMenuNode, setContextMenuNode] = useState<{ id: string; name: string; type: string; status?: string } | null>(null)
   const [flushingNode, setFlushingNode] = useState<string | null>(null)
-  const nodeCodeById = new Map(previewNodes.map(node => [node.id, toCode(node.name, node.type)]))
+  const nodeNameById = new Map(previewNodes.map(node => [node.id, node.name]))
   const timelineItems: SupplyTimelineItem[] = [
     ...suggestions.map(item => ({
       id: item.decision_id,
@@ -150,15 +144,15 @@ export default function SupplyAdminPage() {
       id: item.event_id,
       kind: "event" as const,
       created_at: item.created_at,
-      message: `${item.event_type}: shipment ${item.shipment_id} at ${nodeCodeById.get(item.node_id) ?? item.node_id}`,
+      message: `${item.event_type}: shipment ${item.shipment_id} at ${nodeNameById.get(item.node_id) ?? item.node_id}`,
       decision_id: null,
     })),
   ].sort((left, right) => right.created_at.localeCompare(left.created_at))
 
   function formatNodeRefs(text: string): string {
     let formatted = text
-    for (const [id, code] of nodeCodeById.entries()) {
-      formatted = formatted.replace(new RegExp(`\\b${id}\\b`, "g"), code)
+    for (const [id, name] of nodeNameById.entries()) {
+      formatted = formatted.replace(new RegExp(`\\b${id}\\b`, "g"), name)
     }
     return formatted
   }
@@ -434,12 +428,14 @@ export default function SupplyAdminPage() {
                 {error ? <div className="mt-2 text-[10px] text-amber-300">{error}</div> : null}
                 {tokens.length > 0 ? (
                   <div className="mt-3 border-t border-border/70 pt-2">
-                    <div className="text-[10px] font-semibold tracking-[0.08em] text-muted-foreground">NODE TOKENS (SHOW ONCE)</div>
+                    <div className="text-[10px] font-semibold tracking-[0.08em] text-muted-foreground">NODE LINKS (COPY ONCE)</div>
                     <div className="mt-2 space-y-2">
                       {tokens.map(item => (
                         <div key={item.node_id} className="rounded-none border border-border/60 bg-background/30 p-2 text-[10px]">
-                          <div className="text-muted-foreground">{item.node_id}</div>
-                          <div className="mt-1 break-all text-foreground/95">{item.api_token}</div>
+                          <div className="text-muted-foreground">{nodeNameById.get(item.node_id) ?? item.node_id}</div>
+                          <button type="button" onClick={() => { navigator.clipboard.writeText(`${APP_URL}/node-admin?chain_id=${encodeURIComponent(chainId)}&node_id=${encodeURIComponent(item.node_id)}&token=${encodeURIComponent(item.api_token)}&admin_key=${encodeURIComponent(adminKey)}`) }} className="mt-1 rounded-none border border-border/70 bg-background/35 px-2 py-0.5 text-[10px] font-semibold text-foreground hover:bg-foreground/10">
+                            Copy Node Admin Link
+                          </button>
                         </div>
                       ))}
                     </div>
@@ -493,7 +489,7 @@ export default function SupplyAdminPage() {
                 {tokensOpen ? (
                   <>
                     <div className="flex items-center justify-between border-b border-border/70 px-3 py-2 text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">
-                      <span>NODE TOKENS</span>
+                      <span>NODE LINKS</span>
                       <button type="button" onClick={() => setTokensOpen(false)} className="rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-semibold text-foreground hover:bg-foreground/10">
                         Hide
                       </button>
@@ -502,8 +498,10 @@ export default function SupplyAdminPage() {
                     {tokens.length > 0 ? (
                       tokens.map(item => (
                         <div key={item.node_id} className="rounded-none border border-border/60 bg-background/30 p-2 text-[10px]">
-                          <div className="text-muted-foreground">{item.node_id}</div>
-                          <div className="mt-1 break-all text-foreground/95">{item.api_token}</div>
+                          <div className="text-muted-foreground">{nodeNameById.get(item.node_id) ?? item.node_id}</div>
+                          <button type="button" onClick={() => { navigator.clipboard.writeText(`${APP_URL}/node-admin?chain_id=${encodeURIComponent(chainId)}&node_id=${encodeURIComponent(item.node_id)}&token=${encodeURIComponent(item.api_token)}&admin_key=${encodeURIComponent(adminKey)}`) }} className="mt-1 rounded-none border border-border/70 bg-background/35 px-2 py-0.5 text-[10px] font-semibold text-foreground hover:bg-foreground/10">
+                            Copy Node Admin Link
+                          </button>
                         </div>
                       ))
                     ) : (
@@ -516,10 +514,10 @@ export default function SupplyAdminPage() {
                     type="button"
                     onClick={() => setTokensOpen(true)}
                     className="flex h-full w-full items-center justify-center border-0 bg-transparent px-0 text-[10px] font-semibold tracking-[0.08em] text-muted-foreground hover:bg-foreground/5 hover:text-foreground"
-                    aria-label="Show node tokens"
-                    title="Show node tokens"
+                    aria-label="Show node links"
+                    title="Show node links"
                   >
-                    <span className="origin-center rotate-[-90deg] whitespace-nowrap">SHOW TOKENS</span>
+                    <span className="origin-center rotate-[-90deg] whitespace-nowrap">SHOW LINKS</span>
                   </button>
                 )}
               </aside>

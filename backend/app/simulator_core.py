@@ -12,6 +12,12 @@ from app.agents.without_c import PlannedHop, WithoutCAgent
 from app.demand_generator import DemandGenerator
 from app.models import EdgeSimulationStat, NodeSimulationStat, ShipmentDemand, ShipmentPriority, SimulationLog, SimulationState, World
 
+try:
+    from app.ai.predictor import get_predictor as _get_ai_predictor
+    _ai_predictor = _get_ai_predictor()
+except Exception:
+    _ai_predictor = None
+
 
 @dataclass
 class SimShipment:
@@ -209,6 +215,11 @@ class SimulatorCore:
             blocked_admission_tick += blocked_new
 
             moved_shipments_tick, moved_load_tick = self._dispatch_moves()
+
+            if _ai_predictor is not None:
+                pressure, projected, trend = self._pressure_maps()
+                _ai_predictor.record("simulator", pressure, projected, trend)
+
             self._advance_transit()
             self._advance_holding()
             self._validate_mass_balance()

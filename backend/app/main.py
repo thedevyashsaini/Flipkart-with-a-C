@@ -8,9 +8,7 @@ import json
 import os
 import random
 import secrets
-import urllib.error
-import urllib.parse
-import urllib.request
+from openai import OpenAI
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -29,6 +27,12 @@ from app.agents.with_c import WithCAgent
 from app.demand_generator import DemandGenerator
 from app.models import DemandState, ShipmentPriority, SimulationState, World
 from app.simulator_core import SimulatorCore
+
+try:
+    from app.ai.predictor import get_predictor as _get_ai_predictor
+    _ai_predictor = _get_ai_predictor()
+except Exception:
+    _ai_predictor = None
 
 app = FastAPI()
 
@@ -687,12 +691,63 @@ def simulation_kpi_chart() -> StreamingResponse:
     return StreamingResponse(image_bytes, media_type="image/png")
 
 
+@app.get("/sim/ai-predictions")
+def sim_ai_predictions() -> dict[str, object]:
+    if _ai_predictor is None:
+        return {"ok": False, "predictions": None, "reason": "AI predictor not available (no model found)"}
+
+    pred = _ai_predictor.predict("simulator")
+    if pred is None:
+        return {"ok": False, "predictions": None, "reason": "Not enough data collected yet (need 20 ticks)"}
+
+    return {"ok": True, "predictions": pred}
+
+
+@app.get("/live/chains/{chain_id}/ai-predictions")
+def live_ai_predictions(chain_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+
+    if _ai_predictor is None:
+        return {"ok": False, "predictions": None, "reason": "AI predictor not available"}
+
+    client = require_firestore()
+    live = load_live_chain(client, chain_id)
+    shipments = load_recent_shipments(client, chain_id)
+    pressure, projected, trend = compute_pressure_maps_live(nodes=live["nodes"], edges=live["edges"], shipments=shipments)
+
+    _ai_predictor.record(chain_id, pressure, projected, trend)
+    pred = _ai_predictor.predict(chain_id)
+    if pred is None:
+        return {"ok": False, "predictions": None, "reason": "Not enough data (need 20 ticks)"}
+
+    return {"ok": True, "predictions": pred}
+
+
+CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/d87048eb82bfdd948b5f8fd837c8cbd2/ai/v1"
+
+
+def _cloudflare_ai(prompt: str, temperature: float = 0.2) -> str:
+    token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+    model = os.getenv("GEMINI_MODEL", "google/gemini-2.0-flash-lite").strip() or "google/gemini-2.0-flash-lite"
+    if not token:
+        raise HTTPException(status_code=503, detail="CLOUDFLARE_API_TOKEN is not configured")
+    client = OpenAI(base_url=CLOUDFLARE_AI_URL, api_key=token)
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+        )
+    except Exception as err:
+        raise HTTPException(status_code=502, detail=f"AI request failed: {err}") from err
+    content = response.choices[0].message.content
+    if not content or not content.strip():
+        raise HTTPException(status_code=502, detail="AI returned empty explanation")
+    return content.strip()
+
+
 @app.post("/sim/explain-log")
 def simulation_explain_log(payload: ExplainLogRequest) -> dict[str, str | int | bool]:
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite").strip() or "gemini-2.0-flash-lite"
-    if not api_key:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
     if simulator_core is None:
         raise HTTPException(status_code=503, detail="Simulator unavailable")
 
@@ -726,85 +781,12 @@ def simulation_explain_log(payload: ExplainLogRequest) -> dict[str, str | int | 
         f"{json.dumps(full_graph_state, separators=(',', ':'))}"
     )
 
-    request_body = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt,
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": "text/plain",
-        },
-        "thinkingConfig": {
-            "thinkingBudget": 0,
-        },
-    }
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent?key={urllib.parse.quote(api_key, safe='')}"
     try:
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(request_body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace")
-        if err.code == 400 and "thinkingConfig" in detail:
-            fallback_body = dict(request_body)
-            fallback_body.pop("thinkingConfig", None)
-            fallback_request = urllib.request.Request(
-                url,
-                data=json.dumps(fallback_body).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(fallback_request, timeout=20) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-            except Exception as fallback_err:
-                if log and log.message:
-                    return {"ok": True, "log_id": payload.log_id, "explanation": f"Counterfactual WITH C: {log.message}", "cached": False}
-                raise HTTPException(status_code=503, detail=f"Gemini unavailable: {fallback_err}") from fallback_err
-        elif err.code in {429, 500, 503}:
-            if log and log.message:
-                return {"ok": True, "log_id": payload.log_id, "explanation": f"Counterfactual WITH C: {log.message}", "cached": False}
-            raise HTTPException(status_code=503, detail=f"Gemini unavailable: {detail}") from err
-        else:
-            raise HTTPException(status_code=502, detail=f"Gemini request failed: {detail}") from err
-    except urllib.error.URLError as err:
+        explanation = _cloudflare_ai(prompt)
+    except HTTPException:
         if log and log.message:
             return {"ok": True, "log_id": payload.log_id, "explanation": f"Counterfactual WITH C: {log.message}", "cached": False}
-        raise HTTPException(status_code=502, detail=f"Gemini request failed: {err.reason}") from err
-
-    explanation = ""
-    for candidate in data.get("candidates", []):
-        content = candidate.get("content", {})
-        for part in content.get("parts", []):
-            text = part.get("text", "")
-            if text:
-                explanation = text.strip()
-                break
-        if explanation:
-            break
-
-    if not explanation:
-        for candidate in data.get("candidates", []):
-            content = candidate.get("content", {})
-            merged = "\n".join(part.get("text", "").strip() for part in content.get("parts", []) if part.get("text"))
-            if merged:
-                explanation = merged
-                break
-
-    if not explanation:
-        raise HTTPException(status_code=502, detail="Gemini returned no explanation text")
+        raise
 
     explanation_cache[payload.log_id] = explanation
     return {"ok": True, "log_id": payload.log_id, "explanation": explanation, "cached": False}
@@ -1271,11 +1253,6 @@ def live_explain_decision(decision_id: str, payload: LiveExplainDecisionRequest,
     if not context:
         raise HTTPException(status_code=400, detail="Decision has no explainable context")
 
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite").strip() or "gemini-2.0-flash-lite"
-    if not api_key:
-        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
-
     prompt = (
         "Explain why the recommended WITH C action is appropriate for this live supply-chain state. "
         "Focus on pressure, congestion risk, and stability under uncertainty. "
@@ -1285,57 +1262,12 @@ def live_explain_decision(decision_id: str, payload: LiveExplainDecisionRequest,
         f"Structured context: {json.dumps(context, separators=(',', ':'))}"
     )
 
-    request_body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "text/plain"},
-    }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent?key={urllib.parse.quote(api_key, safe='')}"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(request_body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace")
-        if err.code in {429, 500, 503}:
-            if decision and decision.get("reason"):
-                return {"ok": True, "decision_id": decision_id, "explanation": f"Recommendation: {decision.get('reason', 'See suggestion')}", "cached": False}
-            raise HTTPException(status_code=503, detail=f"Gemini unavailable: {detail}") from err
-        raise HTTPException(status_code=502, detail=f"Gemini request failed: {detail}") from err
-    except urllib.error.URLError as err:
+        explanation = _cloudflare_ai(prompt)
+    except HTTPException:
         if decision and decision.get("reason"):
             return {"ok": True, "decision_id": decision_id, "explanation": f"Recommendation: {decision.get('reason', 'See suggestion')}", "cached": False}
-        raise HTTPException(status_code=502, detail=f"Gemini request failed: {err.reason}") from err
-
-    explanation = ""
-    for candidate in data.get("candidates", []):
-        content = candidate.get("content", {})
-        for part in content.get("parts", []):
-            text = part.get("text", "")
-            if text:
-                explanation = text.strip()
-                break
-        if explanation:
-            break
-
-    if not explanation:
-        fallback_parts: list[str] = []
-        for candidate in data.get("candidates", []):
-            content = candidate.get("content", {})
-            for part in content.get("parts", []):
-                if part.get("thought") or part.get("thoughtSignature"):
-                    continue
-                text = str(part.get("text", "")).strip()
-                if text:
-                    fallback_parts.append(text)
-        explanation = "\n".join(fallback_parts).strip()
-
-    if not explanation:
-        raise HTTPException(status_code=502, detail="Gemini returned no explanation text")
+        raise
 
     live_explanation_cache[cache_key] = explanation
     return {"ok": True, "decision_id": decision_id, "explanation": explanation, "cached": False}

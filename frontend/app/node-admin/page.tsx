@@ -1,4 +1,4 @@
-"use client"
+﻿"use client"
 
 import { useEffect, useMemo, useState, useCallback } from "react"
 
@@ -127,14 +127,37 @@ export default function NodeAdminPage() {
   const [incomingDrawerOpen, setIncomingDrawerOpen] = useState(false)
   const [contextMenuNode, setContextMenuNode] = useState<{ id: string; name: string; type: string; status?: string } | null>(null)
   const [flushingNode, setFlushingNode] = useState<string | null>(null)
+  const [aiPredictions, setAiPredictions] = useState<Record<string, { current: number; p3: number; p6: number; p12: number }> | null>(null)
+  const [nodeName, setNodeName] = useState("")
+  const [destinationNodeName, setDestinationNodeName] = useState("")
+  const [urlError, setUrlError] = useState("")
+  const nodeNameToId = useMemo(() => new Map(nodes.map(n => [n.name, n.id])), [nodes])
+  const nodeNameById = useMemo(() => new Map(nodes.map(n => [n.id, n.name])), [nodes])
 
   useEffect(() => {
-    setChainId(cacheGet("node.chain_id", ""))
-    setNodeId(cacheGet("node.node_id", ""))
-    setNodeToken(cacheGet("node.token", ""))
-    setAdminKey(cacheGet("node.admin_key", ""))
+    const params = new URLSearchParams(typeof window !== "undefined" ? window.location.search : "")
+    const qChainId = params.get("chain_id")
+    const qNodeId = params.get("node_id")
+    const qToken = params.get("token")
+    const qAdminKey = params.get("admin_key")
+
+    if (!qChainId || !qNodeId || !qToken || !qAdminKey) {
+      setUrlError("Missing required URL parameters. Expected: ?chain_id=...&node_id=...&token=...&admin_key=...")
+      setDidRestore(true)
+      return
+    }
+
+    setChainId(qChainId)
+    setNodeId(qNodeId)
+    setNodeToken(qToken)
+    setAdminKey(qAdminKey)
     setDidRestore(true)
   }, [])
+
+  useEffect(() => {
+    const node = nodes.find(n => n.id === nodeId)
+    setNodeName(node?.name ?? "")
+  }, [nodeId, nodes])
 
   useEffect(() => {
     cacheSet("node.chain_id", chainId)
@@ -147,7 +170,6 @@ export default function NodeAdminPage() {
   const isCreateAction = eventType === "shipment_created"
   const needsDestinationNode = eventType === "shipment_created" || eventType === "shipment_dispatched" || eventType === "shipment_rerouted"
   const needsShipmentMetadata = eventType === "shipment_created"
-  const nodeCodeById = useMemo(() => new Map(nodes.map(node => [node.id, toCode(node.name, node.type)])), [nodes])
   const nodeById = useMemo(() => new Map(nodes.map(node => [node.id, node])), [nodes])
   const selectedNode = useMemo(() => nodeById.get(nodeId) ?? null, [nodeById, nodeId])
   const incomingShipments = useMemo(
@@ -161,8 +183,8 @@ export default function NodeAdminPage() {
 
   function formatNodeRefs(text: string): string {
     let formatted = text
-    for (const [id, code] of nodeCodeById.entries()) {
-      formatted = formatted.replace(new RegExp(`\\b${id}\\b`, "g"), code)
+    for (const [id, name] of nodeNameById) {
+      formatted = formatted.replace(new RegExp(`\\b${id}\\b`, "g"), name)
     }
     return formatted
   }
@@ -170,6 +192,7 @@ export default function NodeAdminPage() {
   function resetSubmissionForm() {
     setShipmentId("")
     setDestinationNodeId("")
+    setDestinationNodeName("")
     setLoad("")
     setPriority("medium")
     setDeadlineTick("")
@@ -191,6 +214,9 @@ export default function NodeAdminPage() {
     setDecisionExplanations({})
     setActiveDecisionId(null)
     setLoadingDecisionId(null)
+    setAiPredictions(null)
+    setNodeName("")
+    setDestinationNodeName("")
     setError("")
     resetSubmissionForm()
   }
@@ -200,6 +226,30 @@ export default function NodeAdminPage() {
       void refreshAll()
     }
   }, [didRestore])
+
+  useEffect(() => {
+    if (!chainId || !adminKey) {
+      return
+    }
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_BASE}/live/chains/${chainId}/ai-predictions`, {
+          headers: { "X-Admin-Api-Key": adminKey },
+          cache: "no-store",
+        })
+        if (!response.ok) {
+          return
+        }
+        const data = await response.json() as { ok: boolean; predictions: Record<string, { current: number; p3: number; p6: number; p12: number }> | null }
+        if (data.ok && data.predictions) {
+          setAiPredictions(data.predictions)
+        }
+      } catch {
+        // silence
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [chainId, adminKey])
 
   async function refreshAll() {
     if (!chainId || !nodeId) {
@@ -392,6 +442,17 @@ export default function NodeAdminPage() {
     }
   }
 
+  if (urlError) {
+    return (
+      <main className="grid min-h-svh place-items-center bg-gradient-to-br from-background via-background to-muted/40 p-6">
+        <div className="max-w-md rounded-none border border-border/60 bg-card/95 p-6 text-center">
+          <div className="text-sm font-semibold text-rose-200">Invalid URL</div>
+          <div className="mt-2 text-[10px] text-muted-foreground">{urlError}</div>
+        </div>
+      </main>
+    )
+  }
+
   return (
     <main className="grid min-h-svh place-items-center bg-gradient-to-br from-background via-background to-muted/40 p-6">
       <section className="relative h-[84vh] w-full max-w-[96vw] overflow-hidden rounded-none border border-border bg-card">
@@ -402,7 +463,7 @@ export default function NodeAdminPage() {
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
               <div className="rounded-none border border-border/60 bg-background/25 p-2 text-[10px]">
                 <div className="text-muted-foreground">Node</div>
-                <div className="mt-1 text-foreground/95">{selectedNode ? `${toCode(selectedNode.name, selectedNode.type)} · ${selectedNode.name}` : nodeId || "-"}</div>
+                <div className="mt-1 text-foreground/95">{selectedNode ? selectedNode.name : nodeName || nodeId || "-"}</div>
               </div>
               <div className="grid grid-cols-2 gap-2 text-[10px]">
                 <div className="rounded-none border border-border/60 bg-background/25 p-2">
@@ -435,8 +496,8 @@ export default function NodeAdminPage() {
                     incomingShipments.map(shipment => (
                       <div key={shipment.shipment_id} className="rounded-none border border-border/60 bg-background/30 p-2 text-[10px]">
                         <div className="text-foreground/95">Shipment {shipment.shipment_id}</div>
-                        <div className="mt-1 text-muted-foreground">From {nodeCodeById.get(shipment.current_node_id) ?? shipment.current_node_id}</div>
-                        <div className="text-muted-foreground">Origin {nodeCodeById.get(shipment.source_node_id) ?? shipment.source_node_id}</div>
+                        <div className="mt-1 text-muted-foreground">From {nodeNameById.get(shipment.current_node_id) ?? shipment.current_node_id}</div>
+                        <div className="text-muted-foreground">Origin {nodeNameById.get(shipment.source_node_id) ?? shipment.source_node_id}</div>
                       </div>
                     ))
                   ) : (
@@ -448,6 +509,7 @@ export default function NodeAdminPage() {
                 <div className="text-muted-foreground">At This Node</div>
                 <div className="mt-1 text-lg font-semibold text-foreground">{localShipments.length}</div>
               </div>
+
             </div>
           </aside>
 
@@ -467,7 +529,7 @@ export default function NodeAdminPage() {
             </div>
             <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
               <div className="rounded-none border border-border/60 bg-background/25 p-2 text-[10px] text-muted-foreground">
-                Showing only suggestions and events for node {(nodeCodeById.get(nodeId) ?? nodeId) || "-"}
+                Showing only suggestions and events for {nodeName || nodeId || "-"}
               </div>
               {timeline.map(item => (
                 <div key={item.id} className="rounded-none border border-border/60 bg-background/30 p-2 text-[10px]">
@@ -495,25 +557,9 @@ export default function NodeAdminPage() {
           </section>
 
           <aside className="flex w-[19rem] flex-col border-l border-border/80 bg-card/95">
-            <div className="border-b border-border/70 px-3 py-2 text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">NODE ACTION CONSOLE</div>
+            <div className="border-b border-border/70 px-3 py-2 text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">NODE ACTIONS</div>
             <div className="min-h-0 flex-1 overflow-y-auto p-3">
-            <label className="flex flex-col gap-1 text-[10px] text-muted-foreground">
-              <span>Chain ID</span>
-              <input value={chainId} onChange={event => setChainId(event.target.value)} className="h-8 rounded-none border border-border/70 bg-background/35 px-2 text-xs text-foreground" />
-            </label>
-            <label className="mt-2 flex flex-col gap-1 text-[10px] text-muted-foreground">
-              <span>Node ID</span>
-              <input list="node-ids" value={nodeId} onChange={event => setNodeId(event.target.value)} className="h-8 rounded-none border border-border/70 bg-background/35 px-2 text-xs text-foreground" />
-            </label>
-            <label className="mt-2 flex flex-col gap-1 text-[10px] text-muted-foreground">
-              <span>Node Bearer Token</span>
-              <textarea value={nodeToken} onChange={event => setNodeToken(event.target.value)} className="h-14 rounded-none border border-border/70 bg-background/35 p-2 text-[10px] text-foreground" />
-            </label>
-            <label className="mt-2 flex flex-col gap-1 text-[10px] text-muted-foreground">
-              <span>Supply Admin API Key (for Why + search)</span>
-              <input value={adminKey} onChange={event => setAdminKey(event.target.value)} className="h-8 rounded-none border border-border/70 bg-background/35 px-2 text-xs text-foreground" />
-            </label>
-            <div className="mt-2 grid grid-cols-1 gap-2">
+            <div className="grid grid-cols-1 gap-2">
               <label className="flex flex-col gap-1 text-[10px] text-muted-foreground">
                 <span>Action</span>
                 <select value={eventType} onChange={event => setEventType(event.target.value as typeof eventType)} className="h-8 rounded-none border border-border/70 bg-background/35 px-2 text-xs text-foreground">
@@ -537,15 +583,17 @@ export default function NodeAdminPage() {
             </label>
             {needsDestinationNode ? (
               <label className="mt-2 flex flex-col gap-1 text-[10px] text-muted-foreground">
-                <span>{eventType === "shipment_created" ? "Destination Node ID" : "Target Node ID"}</span>
-                <input list="node-ids" value={destinationNodeId} onChange={event => setDestinationNodeId(event.target.value)} className="h-8 rounded-none border border-border/70 bg-background/35 px-2 text-xs text-foreground" />
+                <span>{eventType === "shipment_created" ? "Destination Node" : "Target Node"}</span>
+                <div className="relative">
+                  <input list="node-names-dest" value={destinationNodeName} placeholder="-- Select node --" onChange={event => { setDestinationNodeName(event.target.value); setDestinationNodeId(nodeNameToId.get(event.target.value) ?? "") }} className="h-8 w-full rounded-none border border-border/70 bg-background/35 px-2 text-xs text-foreground" />
+                  <datalist id="node-names-dest">
+                    {nodes.map(node => (
+                      <option key={node.id} value={node.name} />
+                    ))}
+                  </datalist>
+                </div>
               </label>
             ) : null}
-            <datalist id="node-ids">
-              {nodes.map(node => (
-                <option key={node.id} value={node.id}>{toCode(node.name, node.type)}</option>
-              ))}
-            </datalist>
             {needsShipmentMetadata ? (
               <>
                 <div className="mt-2 grid grid-cols-2 gap-2">
@@ -569,16 +617,8 @@ export default function NodeAdminPage() {
                 </label>
               </>
             ) : null}
-            <div className="mt-2 grid grid-cols-2 gap-2">
-              <button type="button" onClick={() => void submitEvent()} disabled={!canOperate} className="rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-semibold text-foreground hover:bg-foreground/10 disabled:opacity-60">
-                Submit
-              </button>
-              <button type="button" onClick={() => void refreshAll()} className="rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-semibold text-foreground hover:bg-foreground/10">
-                Refresh
-              </button>
-            </div>
-            <button type="button" onClick={resetNodeSession} className="mt-2 w-full rounded-none border border-rose-300/30 bg-rose-400/10 px-2 py-1 text-[10px] font-semibold text-rose-200 hover:bg-rose-400/15">
-              Reset Node Session
+            <button type="button" onClick={() => void submitEvent()} disabled={!canOperate} className="mt-2 w-full rounded-none border border-border/70 bg-background/35 px-2 py-1 text-[10px] font-semibold text-foreground hover:bg-foreground/10 disabled:opacity-60">
+              Submit
             </button>
             {error ? <div className="mt-2 text-[10px] text-amber-300">{error}</div> : null}
             </div>
