@@ -438,6 +438,8 @@ export default function Page() {
   const [hoveredCounterfactualLogId, setHoveredCounterfactualLogId] = useState<number | null>(null)
   const [activeCounterfactualLogId, setActiveCounterfactualLogId] = useState<number | null>(null)
   const [logExplanations, setLogExplanations] = useState<Record<number, { status: "loading" | "done" | "error"; text: string }>>({})
+  const [aiPredictions, setAiPredictions] = useState<Record<string, { current: number; p3: number; p6: number; p12: number }> | null>(null)
+  const [aiPredictionStatus, setAiPredictionStatus] = useState<"idle" | "loading" | "available" | "unavailable">("idle")
 
   const selectedNodeDetails = useMemo(
     () => toSelectedNodeDetails(world, simState, selectedNodeId),
@@ -454,6 +456,25 @@ export default function Page() {
     () => toSelectedEdgeDetails(world, simState, selectedEdgeCorridor),
     [world, simState, selectedEdgeCorridor],
   )
+  const nodeCodeById = useMemo(() => {
+    if (!world) {
+      return new Map<string, string>()
+    }
+    const usedCodes = new Set<string>()
+    const map = new Map<string, string>()
+    for (const node of world.nodes) {
+      const base = toCode(node.name, node.type)
+      let code = base
+      let suffix = 0
+      while (usedCodes.has(code)) {
+        code = `${base.slice(0, 3)}${String.fromCharCode(65 + (suffix % 26))}`
+        suffix += 1
+      }
+      usedCodes.add(code)
+      map.set(node.id, code)
+    }
+    return map
+  }, [world])
   const failedNodeCodes = useMemo(() => {
     if (!world || !simState?.failed_node_names?.length) {
       return []
@@ -856,6 +877,32 @@ export default function Page() {
 
     void refreshKpiChart()
   }, [simState?.running, simState?.tick])
+
+  useEffect(() => {
+    if (!simState?.running) {
+      setAiPredictionStatus("idle")
+      return
+    }
+
+    setAiPredictionStatus("loading")
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_BASE}/sim/ai-predictions`, { cache: "no-store" })
+        if (!response.ok) {
+          return
+        }
+        const data = await response.json() as { ok: boolean; predictions: Record<string, { current: number; p3: number; p6: number; p12: number }> | null }
+        if (data.ok && data.predictions) {
+          setAiPredictions(data.predictions)
+          setAiPredictionStatus("available")
+        }
+      } catch {
+        // silence
+      }
+    }, 2000)
+
+    return () => clearInterval(interval)
+  }, [simState?.running])
 
   return (
     <main className="grid min-h-svh place-items-center bg-gradient-to-br from-background via-background to-muted/40 p-6">
@@ -1274,12 +1321,12 @@ export default function Page() {
               </div>
             </aside>
 
-            <aside className="flex w-52 flex-col border-l border-border/80 bg-card/95">
-              <div className="border-b border-border/70 px-3 py-2 text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">
+            <aside className="flex w-72 flex-col border-l border-border/80 bg-card/95">
+              <div className="shrink-0 border-b border-border/70 px-3 py-2 text-[11px] font-semibold tracking-[0.08em] text-muted-foreground">
                 KPI SNAPSHOT
               </div>
-              <div className="min-h-0 flex-1 overflow-y-auto p-3">
-                <div className="grid grid-cols-1 gap-2 text-xs">
+              <div className="flex min-h-0 flex-1 flex-col p-3">
+                <div className="grid shrink-0 grid-cols-1 gap-2 text-xs">
                   <div className="rounded-none border border-border/70 bg-background/35 p-2">
                     <div className="text-[10px] text-muted-foreground">Delivered %</div>
                     <div className="text-sm font-semibold">{kpiSnapshot.deliveredPct.toFixed(1)}%</div>
@@ -1301,8 +1348,37 @@ export default function Page() {
                     <div className="text-sm font-semibold">{kpiSnapshot.movedLoad.toFixed(1)}t</div>
                   </div>
                 </div>
+
+                <div className="mt-3 flex min-h-0 flex-1 flex-col rounded-none border border-border/60 bg-background/25">
+                  <div className="shrink-0 px-2 pt-2 text-[10px] font-semibold tracking-[0.08em] text-muted-foreground">AI PRESSURE PREDICTIONS</div>
+                  {aiPredictionStatus === "loading" || aiPredictionStatus === "idle" ? (
+                    <div className="flex min-h-0 flex-1 items-center justify-center px-2 pb-2 text-[10px] text-muted-foreground">
+                      {aiPredictionStatus === "loading" ? "Collecting data for predictions..." : "Start simulation to begin"}
+                    </div>
+                  ) : aiPredictionStatus === "unavailable" ? (
+                    <div className="flex min-h-0 flex-1 items-center justify-center px-2 pb-2 text-[10px] text-muted-foreground">Model not loaded</div>
+                  ) : aiPredictions ? (
+                    <div className="flex min-h-0 flex-1 flex-col px-2 pb-2">
+                      <div className="flex shrink-0 items-center justify-between border-b border-border/50 pb-0.5 text-[9px] text-muted-foreground">
+                        <span>Node</span>
+                        <span>Now &rarr; +3 &rarr; +6 &rarr; +12</span>
+                      </div>
+                      <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pt-0.5">
+                        {Object.entries(aiPredictions).slice(0, 28).map(([nodeId, pred]) => (
+                          <div key={nodeId} className="flex items-center justify-between border-b border-border/30 pb-0.5 text-[10px]">
+                            <span className="font-medium text-foreground/80">{nodeCodeById.get(nodeId) ?? nodeId.toUpperCase()}</span>
+                            <span className="font-mono text-foreground/70">
+                              {pred.current.toFixed(3)} &rarr; {pred.p3.toFixed(3)} &rarr; {pred.p6.toFixed(3)} &rarr; {pred.p12.toFixed(3)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
                 {!simState?.running && kpiChartUrl ? (
-                  <div className="mt-2 rounded-none border border-border/60 bg-background/25 p-2">
+                  <div className="mt-2 shrink-0 rounded-none border border-border/60 bg-background/25 p-2">
                     <div className="text-[10px] font-semibold tracking-[0.08em] text-muted-foreground">KPI VS TIME</div>
                     <a
                       href={kpiChartUrl}
@@ -1321,7 +1397,7 @@ export default function Page() {
         )}
 
         {selectedNodeDetails ? (
-          <div className="absolute right-[calc(20rem+13rem)] top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
+          <div className="absolute right-[calc(20rem+18rem)] top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
             <div className="mb-2 flex items-start justify-between gap-2 border-b border-border/70 pb-2">
               <div>
                 <div className="font-semibold text-foreground">{selectedNodeDetails.code} - {selectedNodeDetails.name}</div>
@@ -1358,11 +1434,24 @@ export default function Page() {
               <div className="my-1 border-t border-border/60" />
               <div className="flex justify-between"><span className="text-muted-foreground">Avg Hold</span><span>{selectedNodeDetails.avgHoldTicksPerTon.toFixed(2)} ticks/ton</span></div>
             </div>
+
+            {aiPredictions && aiPredictions[selectedNodeDetails.id] ? (
+              <>
+                <div className="my-1.5 border-t border-border/60" />
+                <div className="mb-0.5 text-[10px] font-semibold tracking-[0.08em] text-muted-foreground">AI PREDICTED PRESSURE</div>
+                <div className="space-y-0.5 text-[10px]">
+                  <div className="flex justify-between"><span className="text-muted-foreground">Now</span><span className="font-mono text-foreground/70">{aiPredictions[selectedNodeDetails.id].current.toFixed(4)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">+3 ticks</span><span className="font-mono text-foreground/70">{aiPredictions[selectedNodeDetails.id].p3.toFixed(4)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">+6 ticks</span><span className="font-mono text-foreground/70">{aiPredictions[selectedNodeDetails.id].p6.toFixed(4)}</span></div>
+                  <div className="flex justify-between"><span className="text-muted-foreground">+12 ticks</span><span className="font-mono text-foreground/70">{aiPredictions[selectedNodeDetails.id].p12.toFixed(4)}</span></div>
+                </div>
+              </>
+            ) : null}
           </div>
         ) : null}
 
         {selectedEdgeDetails ? (
-          <div className="absolute right-[calc(20rem+13rem)] top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
+          <div className="absolute right-[calc(20rem+18rem)] top-16 z-30 w-72 rounded-none border border-border bg-card/95 p-3 text-xs shadow-[0_16px_34px_rgba(0,0,0,0.42)] backdrop-blur-sm">
             <div className="mb-2 flex items-start justify-between gap-2 border-b border-border/70 pb-2">
               <div>
                 <div className="font-semibold text-foreground">{selectedEdgeDetails.sourceCode} &lt;-&gt; {selectedEdgeDetails.targetCode}</div>

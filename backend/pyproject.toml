@@ -10,4 +10,7 @@ dependencies = [
     "matplotlib>=3.10.3",
     "google-auth>=2.40.3",
     "uvicorn[standard]>=0.45.0",
+    "torch>=2.12.0",
+    "pyarrow>=24.0.0",
+    "pandas>=2.3.3",
 ]

@@ -127,6 +127,7 @@ export default function NodeAdminPage() {
   const [incomingDrawerOpen, setIncomingDrawerOpen] = useState(false)
   const [contextMenuNode, setContextMenuNode] = useState<{ id: string; name: string; type: string; status?: string } | null>(null)
   const [flushingNode, setFlushingNode] = useState<string | null>(null)
+  const [aiPredictions, setAiPredictions] = useState<Record<string, { current: number; p3: number; p6: number; p12: number }> | null>(null)
 
   useEffect(() => {
     setChainId(cacheGet("node.chain_id", ""))
@@ -191,6 +192,7 @@ export default function NodeAdminPage() {
     setDecisionExplanations({})
     setActiveDecisionId(null)
     setLoadingDecisionId(null)
+    setAiPredictions(null)
     setError("")
     resetSubmissionForm()
   }
@@ -200,6 +202,30 @@ export default function NodeAdminPage() {
       void refreshAll()
     }
   }, [didRestore])
+
+  useEffect(() => {
+    if (!chainId || !adminKey) {
+      return
+    }
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`${API_BASE}/live/chains/${chainId}/ai-predictions`, {
+          headers: { "X-Admin-Api-Key": adminKey },
+          cache: "no-store",
+        })
+        if (!response.ok) {
+          return
+        }
+        const data = await response.json() as { ok: boolean; predictions: Record<string, { current: number; p3: number; p6: number; p12: number }> | null }
+        if (data.ok && data.predictions) {
+          setAiPredictions(data.predictions)
+        }
+      } catch {
+        // silence
+      }
+    }, 3000)
+    return () => clearInterval(interval)
+  }, [chainId, adminKey])
 
   async function refreshAll() {
     if (!chainId || !nodeId) {
@@ -448,6 +474,18 @@ export default function NodeAdminPage() {
                 <div className="text-muted-foreground">At This Node</div>
                 <div className="mt-1 text-lg font-semibold text-foreground">{localShipments.length}</div>
               </div>
+
+              {aiPredictions && nodeId && aiPredictions[nodeId] ? (
+                <div className="rounded-none border border-border/60 bg-background/25 p-2 text-[10px]">
+                  <div className="mb-1 font-semibold tracking-[0.08em] text-muted-foreground">AI PREDICTED PRESSURE</div>
+                  <div className="space-y-0.5">
+                    <div className="flex justify-between"><span className="text-muted-foreground">Now</span><span className="font-mono text-foreground/70">{aiPredictions[nodeId].current.toFixed(4)}</span></div>
+                    <div className="flex justify-between"><span className="text-muted-foreground">+3 ticks</span><span className="font-mono text-foreground/70">{aiPredictions[nodeId].p3.toFixed(4)}</span></div>
+                    <div className="flex justify-between"><span className="text-muted-foreground">+6 ticks</span><span className="font-mono text-foreground/70">{aiPredictions[nodeId].p6.toFixed(4)}</span></div>
+                    <div className="flex justify-between"><span className="text-muted-foreground">+12 ticks</span><span className="font-mono text-foreground/70">{aiPredictions[nodeId].p12.toFixed(4)}</span></div>
+                  </div>
+                </div>
+              ) : null}
             </div>
           </aside>
 

@@ -30,6 +30,12 @@ from app.demand_generator import DemandGenerator
 from app.models import DemandState, ShipmentPriority, SimulationState, World
 from app.simulator_core import SimulatorCore
 
+try:
+    from app.ai.predictor import get_predictor as _get_ai_predictor
+    _ai_predictor = _get_ai_predictor()
+except Exception:
+    _ai_predictor = None
+
 app = FastAPI()
 
 app.add_middleware(
@@ -685,6 +691,38 @@ def simulation_kpi_chart() -> StreamingResponse:
     FigureCanvas(fig).print_png(image_bytes)
     image_bytes.seek(0)
     return StreamingResponse(image_bytes, media_type="image/png")
+
+
+@app.get("/sim/ai-predictions")
+def sim_ai_predictions() -> dict[str, object]:
+    if _ai_predictor is None:
+        return {"ok": False, "predictions": None, "reason": "AI predictor not available (no model found)"}
+
+    pred = _ai_predictor.predict("simulator")
+    if pred is None:
+        return {"ok": False, "predictions": None, "reason": "Not enough data collected yet (need 20 ticks)"}
+
+    return {"ok": True, "predictions": pred}
+
+
+@app.get("/live/chains/{chain_id}/ai-predictions")
+def live_ai_predictions(chain_id: str, x_admin_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    require_admin_key(x_admin_api_key)
+
+    if _ai_predictor is None:
+        return {"ok": False, "predictions": None, "reason": "AI predictor not available"}
+
+    client = require_firestore()
+    live = load_live_chain(client, chain_id)
+    shipments = load_recent_shipments(client, chain_id)
+    pressure, projected, trend = compute_pressure_maps_live(nodes=live["nodes"], edges=live["edges"], shipments=shipments)
+
+    _ai_predictor.record(chain_id, pressure, projected, trend)
+    pred = _ai_predictor.predict(chain_id)
+    if pred is None:
+        return {"ok": False, "predictions": None, "reason": "Not enough data (need 20 ticks)"}
+
+    return {"ok": True, "predictions": pred}
 
 
 @app.post("/sim/explain-log")
